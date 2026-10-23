@@ -1,0 +1,13 @@
+livekit-cpp
+
+This implementation follows the public LiveKit server protocol and service
+semantics. The original LiveKit server and protocol are Copyright LiveKit, Inc.,
+licensed under the Apache License, Version 2.0.
+
+Protocol source revision: livekit/protocol f09f87aab29b
+Reference server revision: livekit/livekit a390d03d28c895742d9b13c0894880ee67733801
+
+Native WebRTC is an external dependency at WEBRTC_ROOT. Its BSD license,
+PATENTS, and third-party license obligations apply separately. Protobuf v21.12,
+Boost, OpenSSL, nlohmann/json and their transitive dependencies retain their own
+licenses. See each dependency's LICENSE/copyright files before distribution.

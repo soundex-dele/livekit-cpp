@@ -1,0 +1,7 @@
+/out/
+/third_party/
+/tests/node_modules/
+/tests/results/
+/tests/__pycache__/
+*.log
+config.local.json

@@ -1,0 +1,15 @@
+{
+  "version": 3,
+  "configurePresets": [{
+    "name": "windows-x64", "generator": "Visual Studio 17 2022", "architecture": "x64",
+    "binaryDir": "${sourceDir}/out/windows-x64",
+    "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+    "cacheVariables": {
+      "VCPKG_TARGET_TRIPLET": "x64-windows-static",
+      "OPENSSL_USE_STATIC_LIBS": "ON", "OPENSSL_MSVC_STATIC_RT": "ON",
+      "WEBRTC_ROOT": "${sourceDir}/../webrtc"
+    }
+  }],
+  "buildPresets": [{"name": "windows-release", "configurePreset": "windows-x64", "configuration": "Release", "jobs": 8}],
+  "testPresets": [{"name": "windows-release", "configurePreset": "windows-x64", "configuration": "Release", "output": {"outputOnFailure": true}}]
+}
