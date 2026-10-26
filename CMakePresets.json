@@ -9,7 +9,20 @@
       "OPENSSL_USE_STATIC_LIBS": "ON", "OPENSSL_MSVC_STATIC_RT": "ON",
       "WEBRTC_ROOT": "${sourceDir}/../webrtc"
     }
+  }, {
+    "name": "linux-x64", "generator": "Ninja", "binaryDir": "${sourceDir}/out/linux-x64",
+    "cacheVariables": {
+      "CMAKE_BUILD_TYPE": "Release", "WEBRTC_ROOT": "${sourceDir}/../webrtc",
+      "CMAKE_C_COMPILER": "clang-15", "CMAKE_CXX_COMPILER": "clang++-15",
+      "CMAKE_CXX_FLAGS": "-stdlib=libc++"
+    }
   }],
-  "buildPresets": [{"name": "windows-release", "configurePreset": "windows-x64", "configuration": "Release", "jobs": 8}],
-  "testPresets": [{"name": "windows-release", "configurePreset": "windows-x64", "configuration": "Release", "output": {"outputOnFailure": true}}]
+  "buildPresets": [
+    {"name": "windows-release", "configurePreset": "windows-x64", "configuration": "Release", "jobs": 8},
+    {"name": "linux-release", "configurePreset": "linux-x64", "jobs": 4}
+  ],
+  "testPresets": [
+    {"name": "windows-release", "configurePreset": "windows-x64", "configuration": "Release", "output": {"outputOnFailure": true}},
+    {"name": "linux-release", "configurePreset": "linux-x64", "output": {"outputOnFailure": true}}
+  ]
 }

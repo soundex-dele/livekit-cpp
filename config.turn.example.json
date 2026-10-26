@@ -1,0 +1,20 @@
+{
+  "bind": "127.0.0.1",
+  "port": 7880,
+  "keys": {"your-api-key": "replace-with-a-long-random-api-secret"},
+  "max_connections": 256,
+  "media_mode": "sfu",
+  "rtc": {
+    "port_range_start": 50000,
+    "port_range_end": 50100,
+    "ice_servers": [],
+    "turn_rest": {
+      "urls": [
+        "turn:turn.example.com:3478?transport=udp",
+        "turn:turn.example.com:3478?transport=tcp"
+      ],
+      "shared_secret_env": "LIVEKIT_TURN_SECRET",
+      "credential_ttl_seconds": 86400
+    }
+  }
+}

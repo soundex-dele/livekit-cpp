@@ -28,6 +28,7 @@ struct Participant {
   std::map<std::string, PublishedTrack> tracks;
   std::map<std::string, bool> subscriptions;
   std::set<std::string> disabled_tracks;
+  std::map<std::string, VideoSubscription> track_settings;
   bool auto_subscribe = true, closed = false;
   int64_t last_seen = now_ms();
   uint32_t data_sequence = 0;

@@ -1,5 +1,7 @@
 #include "lk/rtc.hpp"
 #include "lk/headless_audio.hpp"
+#include "lk/sfu.hpp"
+#include "lk/codec_audit.hpp"
 #include <boost/asio/post.hpp>
 #include <api/audio/audio_device.h>
 #include <api/create_peerconnection_factory.h>
@@ -12,8 +14,12 @@
 #include <api/task_queue/default_task_queue_factory.h>
 #include <rtc_base/ssl_adapter.h>
 #include <rtc_base/logging.h>
+#ifdef _WIN32
+#include <rtc_base/task_queue_win.h>
+#endif
 #include <media/sctp/dcsctp_transport.h>
 #include <utility>
+#include <cstdlib>
 
 namespace lk {
 namespace {
@@ -46,7 +52,8 @@ class CreateObserver : public webrtc::CreateSessionDescriptionObserver {
 };
 }
 RtcRuntime::RtcRuntime() {
-  webrtc::LogMessage::LogToDebug(webrtc::LS_ERROR);
+  const char* native_log=std::getenv("LK_WEBRTC_LOG");
+  webrtc::LogMessage::LogToDebug(native_log && std::string_view(native_log)=="info" ? webrtc::LS_INFO : webrtc::LS_ERROR);
   ssl_ = webrtc::InitializeSSL();
   if (!ssl_) throw std::runtime_error("WebRTC SSL initialization failed");
   network_ = webrtc::Thread::CreateWithSocketServer();
@@ -55,20 +62,33 @@ RtcRuntime::RtcRuntime() {
   if (!network_->Start() || !worker_->Start() || !signaling_->Start()) throw std::runtime_error("WebRTC thread startup failed");
   webrtc::PeerConnectionFactoryDependencies deps;
   deps.network_thread = network_.get(); deps.worker_thread = worker_.get(); deps.signaling_thread = signaling_.get();
+#ifdef _WIN32
+  deps.task_queue_factory = webrtc::CreateTaskQueueWinFactory();
+#else
   deps.task_queue_factory = webrtc::CreateDefaultTaskQueueFactory();
+#endif
   deps.sctp_factory = std::make_unique<NativeSctpFactory>(network_.get());
   deps.adm = webrtc::make_ref_counted<HeadlessAudioDevice>();
   deps.audio_encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
   deps.audio_decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
-  deps.video_encoder_factory = webrtc::CreateBuiltinVideoEncoderFactory();
-  deps.video_decoder_factory = webrtc::CreateBuiltinVideoDecoderFactory();
+  codec_audit = std::make_shared<CodecAudit>();
+  deps.video_encoder_factory = audited_video_encoders(codec_audit);
+  deps.video_decoder_factory = audited_video_decoders(codec_audit);
   // Received PCM already passed the publisher's processing. Keep server-side
   // echo cancellation, noise suppression and gain control out of the relay.
   webrtc::EnableMedia(deps);
   factory = webrtc::CreateModularPeerConnectionFactory(std::move(deps));
   if (!factory) throw std::runtime_error("WebRTC factory creation failed");
+  sfu = std::make_unique<SfuRouter>(signaling_.get(), network_.get(), worker_.get());
+}
+Json RtcRuntime::media_metrics() const {
+  auto result = sfu->metrics();
+  result["video_encode_calls"] = codec_audit->video_encode_calls.load();
+  result["video_decode_calls"] = codec_audit->video_decode_calls.load();
+  return result;
 }
 RtcRuntime::~RtcRuntime() {
+  sfu.reset();
   factory = nullptr;
   if (signaling_) signaling_->Stop();
   if (worker_) worker_->Stop();
@@ -114,6 +134,7 @@ void Peer::initialize(const Config& config) {
   auto result = runtime_.factory->CreatePeerConnectionOrError(rtc, webrtc::PeerConnectionDependencies(this));
   if (!result.ok()) throw std::runtime_error(std::string(result.error().message()));
   pc_ = result.MoveValue();
+  if (config.media_mode == "sfu") sfu_ = std::make_unique<SfuSession>(*runtime_.sfu, subscriber_);
   if (subscriber_) {
     for (bool reliable : {true, false}) {
       webrtc::DataChannelInit init;
@@ -129,6 +150,7 @@ Peer::~Peer() { close(); }
 void Peer::close() {
   if (closed_) return;
   closed_ = true;
+  sfu_.reset();
   // Unregister before destroying observers; Close synchronizes with the signaling thread.
   channels_.clear(); senders_.clear();
   if (pc_) { pc_->Close(); pc_ = nullptr; }
@@ -142,6 +164,7 @@ void Peer::remote_description(const std::string& type, const std::string& sdp) {
   webrtc::SdpParseError error;
   auto desc = webrtc::CreateSessionDescription(subscriber_ ? webrtc::SdpType::kAnswer : webrtc::SdpType::kOffer, sdp, &error);
   if (!desc) throw Error(400, "invalid_argument", "Invalid SDP: " + error.description);
+  if (sfu_) sfu_->detach();
   auto weak = weak_from_this();
   auto observer = webrtc::make_ref_counted<SetObserver>([weak, io = &io_](std::string error) {
     boost::asio::post(*io, [weak, error] {
@@ -152,6 +175,8 @@ void Peer::remote_description(const std::string& type, const std::string& sdp) {
       try { for (auto& c : candidates) p->ice_candidate(c); }
       catch (const std::exception& e) { p->fail(e.what()); return; }
       if (p->subscriber_) {
+        try { if (p->sfu_) p->sfu_->refresh(p->pc_); }
+        catch (const std::exception& e) { p->fail(e.what()); return; }
         p->negotiating_ = false;
         if (p->events_.negotiated) p->events_.negotiated();
         if (p->dirty_) p->negotiate();
@@ -163,20 +188,44 @@ void Peer::remote_description(const std::string& type, const std::string& sdp) {
 }
 void Peer::create_description(bool offer) {
   if (closed_) return;
+  if (sfu_) {
+    // Advertise only the packet adapter's supported codec contract. Native
+    // defaults also advertise RED/ULPFEC and other codecs; negotiating those
+    // without corresponding receive modules silently discards valid media.
+    for (const auto& transceiver : pc_->GetTransceivers()) {
+      if (transceiver->stopped()) continue;
+      auto capabilities = runtime_.factory->GetRtpReceiverCapabilities(transceiver->media_type());
+      std::vector<webrtc::RtpCodecCapability> codecs;
+      for (const auto& codec : capabilities.codecs)
+        if (codec.name == "opus" || codec.name == "VP8" || codec.name == "rtx") codecs.push_back(codec);
+      auto result = transceiver->SetCodecPreferences(codecs);
+      if (!result.ok()) { fail(std::string(result.message())); return; }
+    }
+  }
   auto weak = weak_from_this();
   auto observer = webrtc::make_ref_counted<CreateObserver>([weak, io = &io_, offer](std::string sdp, std::string error) {
-    boost::asio::post(*io, [weak, offer, sdp, error] {
+    boost::asio::post(*io, [weak, offer, sdp, error]() mutable {
       auto p = weak.lock(); if (!p || p->closed_) return;
       if (!error.empty()) return p->fail(error);
       auto desc = webrtc::CreateSessionDescription(offer ? webrtc::SdpType::kOffer : webrtc::SdpType::kAnswer, sdp);
+      if (!desc) return p->fail("Cannot parse native local description");
+      if (!offer && p->sfu_) {
+        try { p->sfu_->prepare_answer(p->pc_,*desc); desc->ToString(&sdp); }
+        catch (const std::exception& e) { p->fail(e.what()); return; }
+      }
       auto set = webrtc::make_ref_counted<SetObserver>([weak, io = &p->io_, offer, sdp](std::string error) {
         boost::asio::post(*io, [weak, offer, sdp, error] {
           if (auto p = weak.lock(); p && !p->closed_) {
             if (!error.empty()) p->fail(error);
-            else p->events_.description(offer ? "offer" : "answer", sdp);
+            else {
+              try { if (p->sfu_) p->sfu_->refresh(p->pc_); }
+              catch (const std::exception& e) { p->fail(e.what()); return; }
+              p->events_.description(offer ? "offer" : "answer", sdp);
+            }
           }
         });
       });
+      if (p->sfu_) p->sfu_->detach();
       p->pc_->SetLocalDescription(set.get(), desc.release());
     });
   });
@@ -212,18 +261,25 @@ void Peer::add_track(const std::string& sid, const std::string& participant_sid,
   }
   auto result = pc_->AddTrack(local, {participant_sid + "|" + sid});
   if (!result.ok()) { fail(std::string(result.error().message())); return; }
-  senders_[sid] = result.MoveValue(); negotiate();
+  senders_[sid] = result.MoveValue();
+  if (sfu_) sfu_->add(sid, senders_[sid]->id(), remote);
+  negotiate();
 }
 void Peer::remove_track(const std::string& sid) {
   auto it = senders_.find(sid); if (closed_ || it == senders_.end()) return;
+  if (sfu_) sfu_->remove(sid);
   auto result = pc_->RemoveTrackOrError(it->second);
   senders_.erase(it);
   if (!result.ok()) { fail(std::string(result.message())); return; }
   negotiate();
 }
 void Peer::enable_track(const std::string& sid, bool enabled) {
+  if (sfu_) { sfu_->enable(sid, enabled); return; }
   auto it = senders_.find(sid);
   if (it != senders_.end()) it->second->track()->set_enabled(enabled);
+}
+void Peer::track_settings(const std::string& sid,const VideoSubscription& settings) {
+  if (sfu_) sfu_->settings(sid,settings);
 }
 void Peer::observe_channel(webrtc::scoped_refptr<webrtc::DataChannelInterface> channel) {
   if (closed_) return;

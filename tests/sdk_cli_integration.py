@@ -14,6 +14,8 @@ import struct
 import subprocess
 import time
 import wave
+import threading
+import urllib.request
 
 
 def free_port():
@@ -22,10 +24,54 @@ def free_port():
         return sock.getsockname()[1]
 
 
+def wait_server(url, process=None, timeout=20):
+    deadline = time.monotonic() + timeout
+    while True:
+        if process is not None and process.poll() is not None:
+            raise AssertionError("Server exited before becoming healthy")
+        try:
+            with urllib.request.urlopen(url.rstrip('/') + '/healthz', timeout=1) as response:
+                if response.status == 200:
+                    return
+        except OSError:
+            pass
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"Server never became healthy: {url}")
+        time.sleep(.1)
+
+
+def record_metrics(root, port, secret, stop, samples, lock, recording_paths=(), base_url=None):
+    """Authenticated transport samples and optional decoded-recording growth."""
+    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+    head = b64(b'{"alg":"HS256","typ":"JWT"}')
+    body = b64(json.dumps({"iss":"testkey", "exp":int(time.time())+600, "video":{"roomList":True}}).encode())
+    signature = b64(hmac.new(secret.encode(), f"{head}.{body}".encode(), hashlib.sha256).digest())
+    url = (base_url or f"http://127.0.0.1:{port}").rstrip('/')
+    request = urllib.request.Request(f"{url}/metrics", headers={"Authorization":f"Bearer {head}.{body}.{signature}"})
+    with (root / "metrics.jsonl").open("w", encoding="utf-8") as log:
+        while not stop.is_set():
+            sample = {"time":time.time()}
+            try:
+                with urllib.request.urlopen(request, timeout=1) as response:
+                    for line in response.read().decode().splitlines():
+                        key, value = line.split()
+                        sample[key.removeprefix("livekit_cpp_")] = float(value)
+                if recording_paths:
+                    sample["recording_bytes"] = {str(p.relative_to(root)):p.stat().st_size
+                        for directory in recording_paths for p in directory.glob("*.y4m")}
+            except Exception as error:
+                sample["error"] = type(error).__name__
+            with lock:
+                samples.append(sample)
+            log.write(json.dumps(sample) + "\n"); log.flush()
+            stop.wait(.2)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--lk", required=True)
     parser.add_argument("--server", required=True)
+    parser.add_argument("--external-url", help="Use an already running dedicated test server; --server identifies its binary for evidence")
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--output", default="tests/results/sdk-cli-integration")
     args = parser.parse_args()
@@ -34,11 +80,16 @@ def main():
     lk = str(Path(args.lk).resolve())
     port = free_port()
     env = os.environ.copy()
-    env.update(LIVEKIT_URL=f"http://127.0.0.1:{port}", LIVEKIT_API_KEY="testkey",
+    server_url = args.external_url or f"http://127.0.0.1:{port}"
+    env.update(LIVEKIT_URL=server_url, LIVEKIT_API_KEY="testkey",
                LIVEKIT_API_SECRET="integration-test-secret-32-characters", LIVEKIT_TOKEN="")
     children = []
     handles = []
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    metrics_stop = threading.Event()
+    metrics_thread = None
+    metrics_samples = []
+    metrics_lock = threading.Lock()
 
     def run(*cmd, ok=True, timeout=45):
         result = subprocess.run([lk, *cmd], env=env, capture_output=True, text=True,
@@ -92,18 +143,10 @@ def main():
                   "rtc": {"port_range_start": 51000, "port_range_end": 51100}}
         config_path = root / "server.json"
         config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
-        server = start("server", [args.server, "--config", str(config_path)])
-        deadline = time.monotonic() + 20
-        while True:
-            if server.poll() is not None:
-                raise AssertionError(f"Server failed to start; see {root}")
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=.5):
-                    break
-            except OSError:
-                if time.monotonic() > deadline:
-                    raise
-                time.sleep(.1)
+        server = None if args.external_url else start("server", [args.server, "--config", str(config_path)])
+        wait_server(server_url, server)
+        metrics_thread = threading.Thread(target=record_metrics, args=(root,port,env["LIVEKIT_API_SECRET"],metrics_stop,metrics_samples,metrics_lock), kwargs={"base_url":server_url}, daemon=True)
+        metrics_thread.start()
         run("doctor")
         token = run("token", "create", "--room", "test", "--identity", "token-test").strip()
         header, claims, signature = token.split(".")
@@ -135,18 +178,40 @@ def main():
         wait_event("file-sub", sub, "connected")
         # Repeating the flag exercises independent tracks and simultaneous child
         # pipes, and catches CLI parsers that accidentally limit the total to one.
-        pub = start("file-pub", [lk, "room", "publish", "test", "--identity", "file-publisher", "--publish", str(fixture), "--publish", str(fixture), "--ffmpeg", args.ffmpeg, "--exit-after-publish"])
+        pub = start("file-pub", [lk, "room", "publish", "test", "--identity", "file-publisher", "--publish", str(fixture), "--publish", str(fixture), "--ffmpeg", args.ffmpeg, "--exit-after-publish", "--stats-interval-ms", "500"])
         assert pub.wait(timeout=35) == 0, "File publish failed"
         assert sub.wait(timeout=20) == 0
         check_recording(file_recording)
         received = [e for e in events("file-sub") if e.get("event") == "track-summary"]
         assert len(received) == 4 and all(e["frames"] > 20 for e in received), received
+        # Local normal-network regression: each source publishes 120 video
+        # frames. A stalled initial bandwidth probe previously passed the basic
+        # recording check while losing most frames to the native queue timeout.
+        assert all(e["frames"] >= 80 for e in received if e["kind"] == "video"), received
+        with metrics_lock:
+            samples = [s for s in metrics_samples if "sfu_target_bps" in s]
+        assert samples, "No SFU diagnostics samples"
+        peaks = {key: max(s.get(key, 0) for s in samples) for key in (
+            "sfu_pacer_queue_ms", "sfu_pacer_queue_bytes", "sfu_target_bps",
+            "sfu_probe_clusters", "sfu_probe_packets", "sfu_probe_feedback_packets")}
+        assert peaks["sfu_pacer_queue_ms"] < 500, peaks
+        assert peaks["sfu_probe_feedback_packets"] > 0, peaks
+        assert all(s["video_encode_calls"] == 0 and s["video_decode_calls"] == 0 for s in samples)
+        (root / "media-evidence.json").write_text(json.dumps({
+            "server_sha256": hashlib.sha256(Path(args.server).read_bytes()).hexdigest(),
+            "sdk_sha256": hashlib.sha256(Path(lk).read_bytes()).hexdigest(),
+            "server_url":server_url, "external_server":bool(args.external_url),
+            "file_tracks": received, "sampled_peaks": peaks,
+        }, indent=2), encoding="utf-8")
         print("PASS: FFmpeg file decode, Unicode paths, repeated publish (4 tracks), EOF shutdown", flush=True)
         run("room", "delete", "test")
         assert not json.loads(run("room", "list", "test")).get("rooms", [])
         (root / "result.json").write_text(json.dumps({"ok": True, "server": args.server, "checks": ["token", "room-api", "negative-inputs", "demo-video", "opus-audio", "data-channel", "file-publish", "unicode-path", "recording", "shutdown"]}, indent=2), encoding="utf-8")
         print(f"PASS: integration; artifacts: {root}", flush=True)
     finally:
+        metrics_stop.set()
+        if metrics_thread:
+            metrics_thread.join(timeout=2)
         for child in reversed(children):
             if child.poll() is None:
                 child.terminate()

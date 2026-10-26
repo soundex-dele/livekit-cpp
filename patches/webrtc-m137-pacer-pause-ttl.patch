@@ -1,0 +1,26 @@
+diff --git a/modules/pacing/prioritized_packet_queue.cc b/modules/pacing/prioritized_packet_queue.cc
+index 136c878793..523c2647b5 100644
+--- a/modules/pacing/prioritized_packet_queue.cc
++++ b/modules/pacing/prioritized_packet_queue.cc
+@@ -125,7 +125,10 @@ bool PrioritizedPacketQueue::StreamQueue::IsEmpty() const {
+ Timestamp PrioritizedPacketQueue::StreamQueue::LeadingPacketEnqueueTime(
+     int priority_level) const {
+   RTC_DCHECK(!packets_[priority_level].empty());
+-  return packets_[priority_level].begin()->enqueue_time;
++  // The stored enqueue_time excludes cumulative pauses for queue-time stats.
++  // Scheduling and TTL compare against wall time, including after an empty
++  // queue has been paused. Use the original timestamp kept in enqueue_times_.
++  return *packets_[priority_level].begin()->enqueue_time_iterator;
+ }
+ 
+ Timestamp PrioritizedPacketQueue::StreamQueue::LastEnqueueTime() const {
+@@ -454,7 +457,8 @@ void PrioritizedPacketQueue::PurgeOldPacketsAtPriorityLevel(int prio_level,
+       RTC_LOG(LS_INFO) << "Dropping old packet on SSRC: "
+                        << packet.packet->Ssrc()
+                        << " seq:" << packet.packet->SequenceNumber()
+-                       << " time in queue:" << (now - packet.enqueue_time).ms()
++                       << " time in queue:"
++                       << (now - *packet.enqueue_time_iterator).ms()
+                        << " ms";
+       DequeuePacketInternal(packet);
+     }

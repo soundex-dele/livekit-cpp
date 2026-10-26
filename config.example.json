@@ -3,5 +3,6 @@
   "port": 7880,
   "keys": {"your-api-key": "replace-with-a-long-random-secret"},
   "max_connections": 256,
+  "media_mode": "sfu",
   "rtc": {"port_range_start": 50000, "port_range_end": 50100, "ice_servers": []}
 }

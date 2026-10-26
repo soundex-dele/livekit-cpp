@@ -1,4 +1,5 @@
 #pragma once
+#include "lk/video_subscription.hpp"
 #include "lk/config.hpp"
 #include <boost/asio/io_context.hpp>
 #include <api/peer_connection_interface.h>
@@ -9,11 +10,17 @@
 #include <memory>
 
 namespace lk {
+class SfuRouter;
+class SfuSession;
+struct CodecAudit;
 class RtcRuntime {
  public:
   RtcRuntime();
   ~RtcRuntime();
   webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
+  std::unique_ptr<SfuRouter> sfu;
+  std::shared_ptr<CodecAudit> codec_audit;
+  Json media_metrics() const;
  private:
   std::unique_ptr<webrtc::Thread> network_, worker_, signaling_;
   bool ssl_ = false;
@@ -40,6 +47,7 @@ class Peer : public webrtc::PeerConnectionObserver, public std::enable_shared_fr
   void add_track(const std::string& sid, const std::string& participant_sid, Track track);
   void remove_track(const std::string& sid);
   void enable_track(const std::string& sid, bool enabled);
+  void track_settings(const std::string& sid, const VideoSubscription&);
   bool send_data(const std::string& bytes, bool reliable);
   void OnSignalingChange(webrtc::PeerConnectionInterface::SignalingState) override {}
   void OnDataChannel(webrtc::scoped_refptr<webrtc::DataChannelInterface>) override;
@@ -61,6 +69,7 @@ class Peer : public webrtc::PeerConnectionObserver, public std::enable_shared_fr
   bool subscriber_, closed_ = false, negotiating_ = false, dirty_ = false, remote_ready_ = false;
   PeerEvents events_;
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc_;
+  std::unique_ptr<SfuSession> sfu_;
   std::vector<std::unique_ptr<Channel>> channels_;
   std::vector<std::string> candidates_;
   std::deque<std::string> reliable_queue_;
