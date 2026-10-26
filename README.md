@@ -1,6 +1,6 @@
 # livekit-cpp
 
-[媒体服务设计](docs/design.md)说明 SFU 模块、原生依赖、业务服务边界和后续 worker 架构；[平台总体设计](../docs/platform-design.md)定义跨仓库契约。
+[媒体服务设计](docs/design.md)说明 SFU 模块、原生依赖、业务服务边界和后续 worker 架构；[平台总体设计](../docs/architecture/platform-design.md)定义跨仓库契约。
 
 当前开发按用户要求暂停（2026-10-26），完整目标尚未完成。已实现功能、未交付能力、
 最新失败及后续开发入口见 [功能现状与暂停交接](docs/STATUS_AND_HANDOFF.md)。
@@ -96,7 +96,7 @@ libc++abi 和系统运行库；复制单个可执行文件不等于完成离线�
 SDK 连接地址为 `ws://127.0.0.1:7880`，token 使用上面命令的输出。访问局域网可用 `--bind 0.0.0.0`；HTTP/WebSocket TCP 端口默认为 7880，ICE UDP 端口为 50000–50100。生产配置使用自己的 API key/secret：
 
 ```powershell
-Copy-Item config.example.json config.local.json
+Copy-Item config/config.example.json config.local.json
 # 编辑 config.local.json
 .\out\windows-x64\Release\livekit-server.exe --config config.local.json
 ```
@@ -209,10 +209,10 @@ Linux 本机浏览器入口为 `scripts/test-linux-browser.sh`；TURN-only 与�
 
 ## 代码结构
 
-- `src/auth.cpp`：JWT 与 ID 生成。
-- `src/rtc.cpp`：原生 WebRTC 工厂、双 PeerConnection、媒体轨和数据通道。
-- `src/rooms.cpp`：单线程房间状态、权限、发布订阅与 RoomService。
-- `src/http.cpp`：Boost.Beast HTTP/WebSocket 服务、Twirp 编解码及限流边界。
+- `src/auth/auth.cpp`：JWT 与 ID 生成。
+- `src/rtc/rtc.cpp`：原生 WebRTC 工厂、双 PeerConnection、媒体轨和数据通道。
+- `src/rooms/rooms.cpp`：单线程房间状态、权限、发布订阅与 RoomService。
+- `src/transport/http.cpp`：Boost.Beast HTTP/WebSocket 服务、Twirp 编解码及限流边界。
 - `third_party/protocol`：固定到 Go 项目使用的 `f09f87aab29b`，构建时生成 C++ protobuf。
 - `third_party/protobuf`：v21.12，避免与 WebRTC 自带 Abseil 的 ABI 冲突。
 

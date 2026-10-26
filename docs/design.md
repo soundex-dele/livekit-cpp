@@ -2,7 +2,7 @@
 
 版本：v0.1；日期：2026-10-26；读取基线：`da4732d`。本文区分已有单机 RTC 实现与后续服务化目标。
 
-平台业务服务位于 `livekit-server`；本仓库负责媒体控制和媒体数据面。当前可执行文件名 `livekit-server` 保留，部署标识建议用 `livekit-media`。总体边界见 [平台设计](../../docs/platform-design.md)。
+平台业务服务位于 `livekit-server`；本仓库负责媒体控制和媒体数据面。当前可执行文件名 `livekit-server` 保留，部署标识建议用 `livekit-media`。总体边界见 [平台设计](../../docs/architecture/platform-design.md)。
 
 ## 1. 当前能力与限制
 
@@ -16,15 +16,15 @@ Windows 与 Linux x64 服务端有构建和局部媒体测试证据，但文件�
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/main.cpp`、`config.cpp` | 启动、配置、依赖装配与退出 |
-| `src/http.cpp` | Boost.Beast HTTP/WebSocket、Twirp 编解码、请求边界 |
-| `src/auth.cpp` | JWT、权限与 ID |
-| `src/rooms.cpp` | 房间、参与者、发布订阅、管理 API 和生命周期 |
-| `src/rtc.cpp` | WebRTC 工厂、双 PeerConnection、ICE/DTLS 与数据 |
-| `src/sfu.cpp` | SFU 路由、订阅状态、分层和带宽策略 |
-| `src/native_rtp.cpp`、`native_send_transport.cpp` | 原生 RTP 适配、发送反馈与 pacing 集成 |
-| `src/turn.cpp` | coturn REST 临时凭证 |
-| `src/codec_audit.cpp` | 编解码使用审计，验证 SFU 不执行视频编解码 |
+| `src/app/main.cpp`、`config.cpp` | 启动、配置、依赖装配与退出 |
+| `src/transport/http.cpp` | Boost.Beast HTTP/WebSocket、Twirp 编解码、请求边界 |
+| `src/auth/auth.cpp` | JWT、权限与 ID |
+| `src/rooms/rooms.cpp` | 房间、参与者、发布订阅、管理 API 和生命周期 |
+| `src/rtc/rtc.cpp` | WebRTC 工厂、双 PeerConnection、ICE/DTLS 与数据 |
+| `src/sfu/sfu.cpp` | SFU 路由、订阅状态、分层和带宽策略 |
+| `src/backends/webrtc/native_rtp.cpp`、`native_send_transport.cpp` | 原生 RTP 适配、发送反馈与 pacing 集成 |
+| `src/turn/turn.cpp` | coturn REST 临时凭证 |
+| `src/diagnostics/codec_audit.cpp` | 编解码使用审计，验证 SFU 不执行视频编解码 |
 
 房间业务状态在单个 Asio 事件循环串行修改；原生媒体运行于 WebRTC network/worker/signaling 线程，回调投递回事件循环。媒体内部状态按其网络线程归属操作，不由 HTTP 线程直接修改。弱引用与任务安全标记保护关闭后的异步回调。
 

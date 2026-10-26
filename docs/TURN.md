@@ -6,7 +6,7 @@
 
 ## 服务端配置
 
-参考 [config.turn.example.json](../config.turn.example.json)：
+参考 [config.turn.example.json](../config/config.turn.example.json)：
 
 ```json
 {
