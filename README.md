@@ -1,5 +1,7 @@
 # livekit-cpp
 
+[媒体服务设计](docs/design.md)说明 SFU 模块、原生依赖、业务服务边界和后续 worker 架构；[平台总体设计](../docs/platform-design.md)定义跨仓库契约。
+
 当前开发按用户要求暂停（2026-10-26），完整目标尚未完成。已实现功能、未交付能力、
 最新失败及后续开发入口见 [功能现状与暂停交接](docs/STATUS_AND_HANDOFF.md)。
 
