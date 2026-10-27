@@ -43,3 +43,36 @@ packet assertion; `out/pacer-pause-before.log` retains the Windows failure.
 
 Any WebRTC upgrade must re-audit this patch and these tests. Do not silently
 remove the guard, increase TTLs, or replace the native pacer to make tests pass.
+
+## Refresh congestion cause at constant bitrate
+
+`webrtc-m137-probe-cause-refresh.patch` includes the native bandwidth-limited
+cause in `GoogCcNetworkController`'s change detection. In an application-limited
+region (ALR), the delay detector can recover while the target bitrate, loss,
+RTT and stable rate remain unchanged. Previously the probe controller retained
+the old delay-limited cause and rejected periodic ALR probes indefinitely.
+
+The patch forwards actual cause changes through the existing native update
+path. It does not manufacture bandwidth, force probes, reset the estimator or
+bypass delay/loss/RTT safeguards. Apply and rebuild as above, substituting this
+patch filename. Both patches are required; CMake checks both normalized source
+files, and `native-send` checks the linked implementation.
+
+The SFU supplies at most half the native target as padding demand when all
+media is paused and more video is wanted. This keeps feedback flowing while
+leaving room for ALR detection. Actual sending and probing remain controlled
+by GoogCC and the native pacer; completed subscriptions request no padding.
+
+The regression sends real MTU-sized RTP over a simulated FIFO link that falls
+from 1.5 Mbps to 100 kbps at 10 seconds and recovers at 25 seconds. It checks
+video pause, highest-layer recovery, actual video delivery, cold-start time,
+probe feedback and audio priority. It also runs without any audio sender.
+Oversized synthetic packets are not accepted as a substitute for media load.
+
+Windows validation on 2026-10-27: `out/remote-video-minimal-test.log` (aggregate
+workspace) passes all three shaped-link cases. An isolated executable compiled
+the same controller with only the new cause-change condition removed, leaving
+the shared patched library and source intact. With identical MTU-sized traffic,
+the cold-start case stalled at 144155 bps and failed actual-video recovery:
+`out/remote-video-legacy-cause-test.log`. This is a simulated network regression,
+not physical-device or production-network acceptance.

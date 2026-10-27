@@ -1,0 +1,53 @@
+diff --git a/modules/congestion_controller/goog_cc/goog_cc_network_control.cc b/modules/congestion_controller/goog_cc/goog_cc_network_control.cc
+index a50a9b6cc6..bbd3be0e44 100644
+--- a/modules/congestion_controller/goog_cc/goog_cc_network_control.cc
++++ b/modules/congestion_controller/goog_cc/goog_cc_network_control.cc
+@@ -658,7 +658,12 @@ void GoogCcNetworkController::MaybeTriggerOnNetworkChanged(
+       bandwidth_estimation_->GetEstimatedLinkCapacity();
+   stable_target_rate = std::min(stable_target_rate, pushback_target_rate);
+ 
++  const auto bandwidth_limited_cause = GetBandwidthLimitedCause(
++      loss_based_state, bandwidth_estimation_->IsRttAboveLimit(),
++      delay_based_bwe_->last_state());
++
+   if ((loss_based_target_rate != last_loss_based_target_rate_) ||
++      (bandwidth_limited_cause != last_bandwidth_limited_cause_) ||
+       (loss_based_state != last_loss_base_state_) ||
+       (fraction_loss != last_estimated_fraction_loss_) ||
+       (round_trip_time != last_estimated_round_trip_time_) ||
+@@ -670,6 +675,10 @@ void GoogCcNetworkController::MaybeTriggerOnNetworkChanged(
+     last_estimated_round_trip_time_ = round_trip_time;
+     last_stable_target_rate_ = stable_target_rate;
+     last_loss_base_state_ = loss_based_state;
++    // ALR can hold the rate constant after the delay detector recovers. The
++    // probe controller must still learn that congestion no longer blocks
++    // periodic probes, otherwise a paused video-only stream cannot recover.
++    last_bandwidth_limited_cause_ = bandwidth_limited_cause;
+ 
+     alr_detector_->SetEstimatedBitrate(loss_based_target_rate.bps());
+ 
+@@ -692,11 +701,7 @@ void GoogCcNetworkController::MaybeTriggerOnNetworkChanged(
+     update->target_rate = target_rate_msg;
+ 
+     auto probes = probe_controller_->SetEstimatedBitrate(
+-        loss_based_target_rate,
+-        GetBandwidthLimitedCause(bandwidth_estimation_->loss_based_state(),
+-                                 bandwidth_estimation_->IsRttAboveLimit(),
+-                                 delay_based_bwe_->last_state()),
+-        at_time);
++        loss_based_target_rate, bandwidth_limited_cause, at_time);
+     update->probe_cluster_configs.insert(update->probe_cluster_configs.end(),
+                                          probes.begin(), probes.end());
+     update->pacer_config = GetPacingRates(at_time);
+diff --git a/modules/congestion_controller/goog_cc/goog_cc_network_control.h b/modules/congestion_controller/goog_cc/goog_cc_network_control.h
+index 46d1cabe53..c18d722e87 100644
+--- a/modules/congestion_controller/goog_cc/goog_cc_network_control.h
++++ b/modules/congestion_controller/goog_cc/goog_cc_network_control.h
+@@ -129,6 +129,7 @@ class GoogCcNetworkController : public NetworkControllerInterface {
+   DataRate last_pushback_target_rate_;
+   DataRate last_stable_target_rate_;
+   LossBasedState last_loss_base_state_;
++  std::optional<BandwidthLimitedCause> last_bandwidth_limited_cause_;
+ 
+   std::optional<uint8_t> last_estimated_fraction_loss_ = 0;
+   TimeDelta last_estimated_round_trip_time_ = TimeDelta::PlusInfinity();

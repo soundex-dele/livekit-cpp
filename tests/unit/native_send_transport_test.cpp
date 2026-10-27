@@ -7,6 +7,8 @@
 #include <modules/rtp_rtcp/source/rtcp_packet/nack.h>
 #include <rtc_base/thread.h>
 #include <rtc_base/time_utils.h>
+#include <rtc_base/logging.h>
+#include <cstdlib>
 #include <system_wrappers/include/clock.h>
 #include <deque>
 #include <iostream>
@@ -69,7 +71,7 @@ struct NativeClockScope : webrtc::ClockInterface {
   ~NativeClockScope() override {webrtc::SetClockForTesting(previous);}
   int64_t TimeNanos() const override {return clock.CurrentTime().us()*1000;}
 };
-void shaped_link_test(bool cold_start=false) {
+void shaped_link_test(bool cold_start=false,bool video_only=false) {
   webrtc::SimulatedClock clock(1000000);
   // M137's native AlrDetector records its start with global TimeMillis, whereas
   // ProbeController uses Environment::clock. Both must share simulated time.
@@ -79,7 +81,8 @@ void shaped_link_test(bool cold_start=false) {
   std::deque<Delivery> wire;
   auto next_free=clock.CurrentTime();
   int64_t capacity=1500000;
-  uint64_t link_drops=0,audio_received=0;
+  uint64_t link_drops=0,audio_received=0,video_before=0,video_recovered=0;
+  uint16_t video_sequence=0;
   auto last_audio=clock.CurrentTime(); int64_t max_audio_gap=0;
   lk::NativeReceiveTransport receiver(env,[&](auto bytes){transport->feedback(bytes);return true;});
   auto emit=[&](const webrtc::RtpPacketToSend& packet) {
@@ -98,7 +101,10 @@ void shaped_link_test(bool cold_start=false) {
   lk::NativeSendConfig video; video.ssrc=111; video.rtx_ssrc=112; video.payload_type=100; video.rtx_payload_type=101;
   video.extensions={{webrtc::RtpExtension::kTransportSequenceNumberUri,5},{webrtc::RtpExtension::kAbsSendTimeUri,3}};
   auto audio=video; audio.audio=true; audio.ssrc=211; audio.rtx_ssrc.reset(); audio.rtx_payload_type=-1;
-  lk::NativeRtpSender video_sender(env,video,emit,[]{},transport),audio_sender(env,audio,emit,[]{},transport);
+  lk::NativeRtpSender video_sender(env,video,emit,[]{},transport);
+  std::unique_ptr<lk::NativeRtpSender> audio_sender;
+  if (!video_only) audio_sender=std::make_unique<lk::NativeRtpSender>(env,audio,emit,[]{},transport);
+  const int64_t audio_bps=video_only ? 0 : 64000;
   std::vector<lk::VideoBandwidthRequest> requests{{"video",1,{{11,80000},{12,200000},{13,450000}}}};
   if (cold_start) requests[0].layers={{11,450000},{12,700000},{13,900000}};
   bool high_before=false,paused=false,recovered=false;
@@ -109,35 +115,54 @@ void shaped_link_test(bool cold_start=false) {
     capacity=ms<10000 || ms>=25000 ? 1500000 : 100000;
     if (ms%200==0) {
       auto stats=transport->stats();
-      auto allocation=lk::allocate_video_bandwidth(stats.target_bps,64000,clock.TimeInMilliseconds(),requests);
+      auto allocation=lk::allocate_video_bandwidth(stats.target_bps,audio_bps,clock.TimeInMilliseconds(),requests);
       auto selected=requests[0].state.selected;
       if (selected && first_video_ms<0) first_video_ms=ms;
-      transport->set_padding_demand(lk::recovery_padding_demand(stats.target_bps,64000+allocation.video_allocated_bps,selected==13 ? 0 : 514000));
+      transport->set_padding_demand(lk::recovery_padding_demand(stats.target_bps,audio_bps+allocation.video_allocated_bps,selected==13 ? 0 : (video_only ? requests[0].layers.back().bps : 514000)));
+      if(video_only&&ms%5000==0&&std::getenv("LK_WEBRTC_LOG"))std::cout<<"Video-only ms="<<ms<<" target="<<stats.target_bps<<" selected="<<selected<<" allocated="<<allocation.video_allocated_bps<<" padding="<<stats.padding<<" probes="<<stats.probe_clusters<<'\n';
       video_sender.set_media_paused(!selected);
       if (ms>=5000 && ms<10000) high_before|=selected==13;
       if (ms>=15000 && ms<25000) {paused|=!selected; minimum_target=std::min(minimum_target,stats.target_bps);}
       if (ms>=35000) {recovered|=selected==13; maximum_target=std::max(maximum_target,stats.target_bps);}
     }
     if (ms%20==0) {
-      auto seq=uint16_t(ms/20); audio_sender.forward(media(seq,20));
-      for (auto layer:requests[0].layers) if (layer.ssrc==requests[0].state.selected)
-        video_sender.forward(media(seq,size_t(layer.bps/400-80)));
+      auto seq=uint16_t(ms/20); if(audio_sender)audio_sender->forward(media(seq,20));
+      for (auto layer:requests[0].layers) if (layer.ssrc==requests[0].state.selected) {
+        // Model 20 ms of wire demand with MTU-sized RTP packets. A single
+        // 900 kbps packet per tick exceeds the sender capacity and is silently
+        // discarded, leaving only probes instead of the intended media load.
+        const auto wire_bytes=size_t(layer.bps/400);
+        const auto packets=(wire_bytes+1199)/1200;
+        size_t remaining=wire_bytes-packets*80;
+        for (size_t i=0;i<packets;++i) {
+          const auto payload=remaining/(packets-i); remaining-=payload;
+          auto packet=media(video_sequence++,payload);
+          packet.SetTimestamp(90000+ms*90); packet.SetMarker(i+1==packets);
+          video_sender.forward(packet);
+        }
+      }
     }
     transport->process();
     while (!wire.empty() && wire.front().at<=clock.CurrentTime()) {
       auto packet=std::move(wire.front()); wire.pop_front(); packet.packet.set_arrival_time(clock.CurrentTime());
       receiver.receive(packet.packet,packet.audio);
       if (packet.audio) {++audio_received; max_audio_gap=std::max(max_audio_gap,(clock.CurrentTime()-last_audio).ms());last_audio=clock.CurrentTime();}
+      else if (packet.packet.Ssrc()==video.ssrc && packet.packet.payload_size()>0) {
+        if (ms>=5000 && ms<10000) ++video_before;
+        if (ms>=35000) ++video_recovered;
+      }
     }
     receiver.process(); clock.AdvanceTimeMilliseconds(1);
   }
-  std::cout<<"Shaped link: high="<<high_before<<" paused="<<paused<<" recovered="<<recovered
+  std::cout<<"Shaped link: video_only="<<video_only<<" high="<<high_before<<" paused="<<paused<<" recovered="<<recovered
     <<" target_min="<<minimum_target<<" target_recovered_max="<<maximum_target<<" drops="<<link_drops
-    <<" audio_packets="<<audio_received<<" audio_gap_ms="<<max_audio_gap<<" first_video_ms="<<first_video_ms<<'\n';
+    <<" audio_packets="<<audio_received<<" audio_gap_ms="<<max_audio_gap<<" first_video_ms="<<first_video_ms
+    <<" padding="<<transport->stats().padding<<" probes="<<transport->stats().probe_clusters<<" probe_feedback="<<transport->stats().probe_feedback_packets<<'\n';
+  check(video_before>100 && video_recovered>100,"Shaped link did not deliver actual video before and after congestion");
   if (!cold_start) check(high_before,"Unconstrained native estimate never admitted high video");
   check(paused && minimum_target<170000,"Serial-link collapse did not reach allocator through native TWCC");
   check(recovered,"Native probes did not recover video after serial-link capacity returned");
-  check(audio_received>2500 && max_audio_gap<2000,"Audio starved during link collapse/recovery");
+  if (!video_only) check(audio_received>2500 && max_audio_gap<2000,"Audio starved during link collapse/recovery");
   check(transport->stats().probe_feedback_packets>0,"Shaped-link recovery had no native probe feedback");
   if (cold_start) check(first_video_ms>=0 && first_video_ms<3000,"Native padding failed to bootstrap a video above the initial bandwidth budget");
 }
@@ -277,10 +302,11 @@ void run() {
 }
 }
 int main() {
+  if(const char* value=std::getenv("LK_WEBRTC_LOG");value&&std::string_view(value)=="info")webrtc::LogMessage::LogToDebug(webrtc::LS_INFO);
   auto thread=webrtc::Thread::Create(); thread->SetName("native-send-test",nullptr);
   if (!thread->Start()) return 1;
   std::string error;
-  thread->BlockingCall([&]{try {native_queue_pause_test();run();shaped_link_test();shaped_link_test(true);} catch(const std::exception& e){error=e.what();}});
+  thread->BlockingCall([&]{try {native_queue_pause_test();run();shaped_link_test();shaped_link_test(true);shaped_link_test(true,true);} catch(const std::exception& e){error=e.what();}});
   thread->Stop();
   if (!error.empty()) {std::cerr<<error<<'\n';return 1;}
   std::cout<<"PASS native pacing, audio priority, TWCC, bitrate feedback, RTX, mute and teardown\n";

@@ -27,10 +27,16 @@ struct MediaAllocation {
   int64_t media_budget_bps=0,audio_reserved_bps=0,video_allocated_bps=0;
   size_t paused=0;
 };
-// Leave spare capacity visible to native ALR detection. Only fill near-target
-// traffic while more media is desired; GoogCC still caps actual padding rate.
+// Leave spare capacity visible to native ALR detection. Keep feedback alive
+// during a full pause; fill near-target traffic only while more media is wanted.
+// GoogCC still caps actual padding rate.
 inline int64_t recovery_padding_demand(int64_t target_bps,int64_t admitted_bps,int64_t requested_bps) {
-  return admitted_bps>=std::max<int64_t>(0,target_bps)*60/100 ? std::max<int64_t>(0,requested_bps) : 0;
+  if (requested_bps<=0) return 0;
+  // Keep feedback flowing while all video is paused, but leave enough spare
+  // capacity for native ALR detection and its periodic recovery probes.
+  if (admitted_bps<=0)
+    return std::min(requested_bps,std::max<int64_t>(0,target_bps)/2);
+  return admitted_bps>=std::max<int64_t>(0,target_bps)*60/100 ? requested_bps : 0;
 }
 inline MediaAllocation allocate_video_bandwidth(int64_t target_bps,int64_t audio_demand_bps,
     int64_t now_ms,std::vector<VideoBandwidthRequest>& requests) {
