@@ -82,6 +82,11 @@ RtcRuntime::RtcRuntime(bool packet_forwarding) {
   webrtc::EnableMedia(deps);
   factory = webrtc::CreateModularPeerConnectionFactory(std::move(deps));
   if (!factory) throw std::runtime_error("WebRTC factory creation failed");
+  // Local senders and browser receivers must have a loopback ICE path. Without
+  // it, local integration may select a VPN interface even with a localhost URL.
+  webrtc::PeerConnectionFactoryInterface::Options options;
+  options.network_ignore_mask = 0;
+  factory->SetOptions(options);
   sfu = std::make_unique<SfuRouter>(signaling_.get(), network_.get(), worker_.get());
 }
 Json RtcRuntime::media_metrics() const {
