@@ -2,12 +2,32 @@
 
 [媒体服务设计](docs/design.md)说明 SFU 模块、原生依赖、业务服务边界和后续 worker 架构；[平台总体设计](../docs/architecture/platform-design.md)定义跨仓库契约。
 
-当前开发按用户要求暂停（2026-10-26），完整目标尚未完成。已实现功能、未交付能力、
-最新失败及后续开发入口见 [功能现状与暂停交接](docs/STATUS_AND_HANDOFF.md)。
+2026-10-27 已启动 [Go LiveKit 主服务完整替代](docs/GO_REPLACEMENT.md)：以本地
+1.13.10 为基线，兼容现有 Egress/Ingress/SIP/Agent worker。替代尚未完成。
+最新 [配置入口验证](docs/GO_CONFIG_VALIDATION.md)：YAML/JSON、配置正文和密钥
+环境变量覆盖对照 **16/16**，原生 CTest **9/9**；完整 Go 配置仍未支持。
+[音频编码验证](docs/GO_AUDIO_CODEC_VALIDATION.md)：PCMU/PCMA 8 kHz 与 Opus
+混合，单/双 PC 实际音调解码对照 **18/18**。后续视频回归出现间歇失败，详见记录。
+[静音策略验证](docs/GO_MUTE_VALIDATION.md)：默认/显式开启/显式关闭共 **63/63**，
+默认禁止管理员取消静音，发布者仍可主动恢复。
+此前 [H.264 验证](docs/GO_H264_VALIDATION.md)：mode 1、VP8/H.264 混合单/双 PC
+对照 **14/14**，视频编解码调用为零；完整编码/分层矩阵仍待补齐。
+此前 [数据流兼容验证](docs/GO_DATA_VALIDATION.md)：单/双 PC 各 **22/22**，含文本和
+字节流、目的路由、Agent 身份、去重与恢复序号；当前 CTest **8/8**、无头媒体
+**9/9**，纯视频模拟恢复与 720p 切换在当前产物上通过，历史失败记录保留。
+此前 [单 PC 验证](docs/GO_SINGLE_PC_VALIDATION.md) 对照 **13/13**，包含 `/rtc/v1`、
+单连接双向媒体、多轨订阅及恢复。
+此前 [信令恢复验证](docs/GO_RESUME_VALIDATION.md) 对照 **15/15** 通过，覆盖双 PC
+恢复、SyncState、ICE restart 和超过 30 秒信令中断期间的媒体推进。
+此前 [JWT 刷新验证](docs/GO_TOKEN_VALIDATION.md) 对照 21/21 通过，包含实际
+5 分钟续发、动态权限/资料刷新与撤权后再入房。此前隐藏参与者、类型、容量与
+附属生命周期的证据见 [参与者验证](docs/GO_PARTICIPANT_VALIDATION.md)。
+此前平台产品规划的已实现功能、未交付能力及媒体失败仍见
+[功能现状与暂停交接](docs/STATUS_AND_HANDOFF.md)，控制面改进不代表这些失败已关闭。
 
 使用 C++20 实现的 LiveKit **单机服务端兼容项目**。原生 WebRTC 直接来自 `D:\workspace\webrtc`，不启动 Go 服务，也不经由 Rust FFI。
 
-默认媒体链路是 **基于 libwebrtc 原生模块的 RTP 包级 SFU**，支持 Opus / VP8 / RTX，以及最多三层 VP8 simulcast 的订阅选层。转发保留编码帧内容，服务端视频编解码调用数通过集成测试检查为零。NACK、RTX、PLI、重传缓存、RTCP 解析和上行拥塞反馈复用 libwebrtc。下行复用原生 pacing 和 GoogCC，应用层根据其预算进行音频预留、视频优先级分配和升降层。容量及完整弱网验收仍待完成，当前吞吐量不能按商业 RTC 产品估算。完整实施范围见 [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md)。
+默认媒体链路是 **基于 libwebrtc 原生模块的 RTP 包级 SFU**，支持 Opus / PCMU / PCMA / VP8 / H.264 mode 1 / RTX，以及最多三层 VP8 simulcast 的订阅选层。转发保留编码帧内容，服务端视频编解码调用数通过集成测试检查为零。NACK、RTX、PLI、重传缓存、RTCP 解析和上行拥塞反馈复用 libwebrtc。下行复用原生 pacing 和 GoogCC，应用层根据其预算进行音频预留、视频优先级分配和升降层。容量及完整弱网验收仍待完成，当前吞吐量不能按商业 RTC 产品估算。完整实施范围见 [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md)。
 
 配置 `"media_mode": "relay"` 可运行原先的解码重编码链路，默认值为 `"sfu"`。SFU 内部适配器依赖相邻 M137 WebRTC 的内部接口；升级 WebRTC 时必须重新验证，当前不宣称生产就绪。
 
@@ -53,7 +73,7 @@ Ubuntu 22.04 x64 已完成原生构建、CTest 4/4 和 Linux 本机浏览器九�
 构建目录放在 Linux 文件系统。
 
 ```bash
-sudo apt-get install git pkg-config ninja-build clang-15 libc++-15-dev libc++abi-15-dev libssl-dev libboost-dev \
+sudo apt-get install git pkg-config ninja-build clang-15 libc++-15-dev libc++abi-15-dev libssl-dev zlib1g-dev libboost-dev \
   nlohmann-json3-dev libvpx-dev nasm python3-venv meson curl
 bash scripts/bootstrap-linux.sh
 bash scripts/build-linux-deps.sh
@@ -66,10 +86,10 @@ WebRTC 默认位于相邻的 `../webrtc`，也可追加 `-DWEBRTC_ROOT=/path/to/
 脚本依次配置、编译服务端与原生测试、运行 CTest。系统 CMake 低于 3.24 时，
 在 `out/linux-tools` 中安装固定的 CMake 3.31.6；可用 `CMAKE_COMMAND` 指定工具。
 Linux 的 libvpx 通过 pkg-config 映射到原生清单所需的目标名称。
-源码引导脚本按完整提交号获取 LiveKit protocol 和 Protobuf 21.12；已有依赖
+源码引导脚本按完整提交号获取 LiveKit protocol、Protobuf 21.12 和 yaml-cpp 0.8.0；已有依赖
 若版本不符或有本地修改会报错并保留原文件，不会自动重置。
-离线环境可设置 `LK_SOURCE_MIRROR=/path/to/mirror`，其中包含 `protocol` 和
-`protobuf` Git 仓库及固定提交；脚本验证相同提交，网络获取有明确超时。
+离线环境可设置 `LK_SOURCE_MIRROR=/path/to/mirror`，其中包含 `protocol`、
+`protobuf` 和 `yaml-cpp` Git 仓库及固定提交；脚本验证相同提交，网络获取有明确超时。
 Linux preset 选择 Clang 15 与 libc++；Clang 14 / libstdc++ 11 无法编译本版本
 WebRTC 使用的嵌套 optional 类型。更换工具链时使用新目录，例如
 `LK_BUILD_DIR="$PWD/out/linux-clang15" bash scripts/build-linux.sh ...`。
@@ -101,6 +121,16 @@ Copy-Item config/config.example.json config.local.json
 .\out\windows-x64\Release\livekit-server.exe --config config.local.json
 ```
 
+与 Go 一致，默认禁止管理员远程取消静音；需要启用时，在 JSON 配置中加入
+`"room": {"enable_remote_unmute": true}`。发布者主动恢复不受此配置限制。
+
+同一配置也可以用 YAML 编写（见 [YAML 示例](config/config.example.yaml)），或通过 `--config-body` / `LIVEKIT_CONFIG` 传入。
+非空配置正文优先于 `--config` 文件；`--keys` / `LIVEKIT_KEYS` 使用 YAML
+`key: secret` 映射替换配置中的密钥表，显式参数优先于对应环境变量。
+`--dev` 可与配置合用，只在最终密钥表为空时补开发密钥。支持单个
+`bind_addresses: [127.0.0.1]`；多监听地址以及顶层、room、rtc 的未知字段会明确拒绝。
+默认监听地址和 RTC 端口范围仍沿用本 C++ 服务默认值，完整 Go 配置兼容未完成。
+
 公网部署需在反向代理配置 HTTPS/WSS，并根据网络情况配置可达的 STUN/TURN。当前不含内置 TURN 或公网 IP 重写功能。不要将示例配置中的占位密钥直接用于部署。
 
 ```js
@@ -121,9 +151,11 @@ await room.localParticipant.setMicrophoneEnabled(true);
 
 | 功能 | 实现情况 |
 |---|---|
-| JWT HS256 | 验签、issuer、过期/生效时间、房间授权、发布/订阅/数据权限 |
+| JWT HS256 | 验签、必需 exp 与 60 秒容差、房间/媒体权限、入房与周期/动态 claims 刷新；完整权限矩阵仍待验收 |
+| 媒体订阅 ACL | 发布者按 identity/SID 与 track SID 授权，动态撤销/恢复、录制豁免；Go 对照 23/23，见 [验证记录](docs/GO_ACL_VALIDATION.md) |
+| 参与者 | hidden 可见性、kind/kindDetails、录制/Agent 容量豁免、录制状态及附属参与者空房清理 |
 | 信令 | `/rtc` 双 PeerConnection，官方 protobuf 二进制消息，JSON 请求，ICE trickle、ping/pong |
-| RoomService | Create/List/DeleteRoom、List/Get/RemoveParticipant、MutePublishedTrack、UpdateParticipant、UpdateSubscriptions、SendData、UpdateRoomMetadata |
+| RoomService | Create/List/DeleteRoom、List/Get/RemoveParticipant、MutePublishedTrack、UpdateParticipant、UpdateSubscriptions、SendData、UpdateRoomMetadata、PerformRpc；Forward/Move 对齐 Go 开源基线的失败行为 |
 | API 编码 | Twirp JSON / protobuf，Bearer token，标准错误结构 |
 | 音视频 | Opus / VP8，发布/订阅、后加入订阅、静音、退订、重新协商 |
 | Simulcast | VP8 最多三层，LOW/MEDIUM/HIGH 或目标宽高，关键帧切层、独立订阅设置、停发层回退 |
@@ -132,7 +164,7 @@ await room.localParticipant.setMicrophoneEnabled(true);
 | 生命周期 | 重复 identity 替换、房间容量、空房超时、心跳超时、关闭清理 |
 | 运维 | JSON 配置、`/healthz`、需 roomList 权限的 `/metrics`、退出信号处理 |
 
-暂不支持订阅帧率限制、RED/ULPFEC、SVC 时空层选择、dynacast、E2EE 媒体转发、无缝会话恢复、单 PeerConnection `/rtc/v1`、Redis 集群、内置 TURN、Egress/Ingress、SIP、Agent 调度、Webhook、说话人检测及新式 data track/blob API。SFU 通过原生 CodecPreferences 明确协商 Opus / VP8 / RTX，不宣告尚未接入的编码或 FEC 能力。断线恢复使用完整重连。隐藏参与者和逐发布者订阅 ACL 尚未实现；请求不受支持的限制时明确拒绝，不会静默绕过限制。
+暂不支持订阅帧率限制、RED/ULPFEC、SVC 时空层选择、dynacast、E2EE 媒体转发、无缝会话恢复、单 PeerConnection `/rtc/v1`、Redis 集群、内置 TURN、Egress/Ingress、SIP、Agent 调度、Webhook、说话人检测及新式 data track/blob API。SFU 通过原生 CodecPreferences 明确协商 Opus / VP8 / RTX，不宣告尚未接入的编码或 FEC 能力。断线恢复使用完整重连。隐藏参与者及媒体 ACL 已支持，data track/blob ACL 仍未支持；参与者 kind 支持不代表对应外部 worker 已完成联调。
 
 订阅者可调用官方 Web SDK 的 `publication.setVideoQuality(VideoQuality.LOW)` 或 `publication.setVideoDimensions({width:600,height:300})`。宽高优先于 quality，以满足尺寸的最小可用层作为请求上限；实际层还受共享带宽限制，单层发布无法凭空产生低清层。LOW/MEDIUM/HIGH 对应发布端从低到高的协商层顺序，与官方 LiveKit SDK 一致。等待目标层关键帧时，仅在旧层仍符合预算的情况下继续转发；订阅 SSRC 不变。层连续 2 秒无完整帧时回退到可用层。设置跨退订/重订保留。
 
@@ -215,6 +247,7 @@ Linux 本机浏览器入口为 `scripts/test-linux-browser.sh`；TURN-only 与�
 - `src/transport/http.cpp`：Boost.Beast HTTP/WebSocket 服务、Twirp 编解码及限流边界。
 - `third_party/protocol`：固定到 Go 项目使用的 `f09f87aab29b`，构建时生成 C++ protobuf。
 - `third_party/protobuf`：v21.12，避免与 WebRTC 自带 Abseil 的 ABI 冲突。
+- `third_party/yaml-cpp`：0.8.0，固定提交 `f7320141120f720aecc4c32be25586e7da9eb978`，与服务端使用相同 C++ 运行时编译。
 
 所有房间状态只在一个 Asio 事件循环中变更；WebRTC 自身运行于 network/worker/signaling 线程，回调投递回事件循环。模块间通过弱引用防止断开后的回调访问已释放会话。
 

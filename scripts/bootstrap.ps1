@@ -12,5 +12,13 @@ $ProtobufPath = Join-Path $ProjectRoot 'third_party/protobuf'
 if (-not (Test-Path -LiteralPath $ProtobufPath)) {
     Invoke-Checked { git clone --branch v21.12 --depth 1 https://github.com/protocolbuffers/protobuf.git $ProtobufPath }
 }
-Invoke-Checked { & (Join-Path $VcpkgRoot 'vcpkg.exe') install boost-beast:x64-windows-static nlohmann-json:x64-windows-static openssl:x64-windows-static libvpx:x64-windows-static dav1d:x64-windows-static }
+$YamlPath = Join-Path $ProjectRoot 'third_party/yaml-cpp'
+if (-not (Test-Path -LiteralPath $YamlPath)) {
+    Invoke-Checked { git clone --branch 0.8.0 --depth 1 https://github.com/jbeder/yaml-cpp.git $YamlPath }
+}
+$YamlRevision = git -C $YamlPath rev-parse HEAD
+if ($LASTEXITCODE -ne 0 -or $YamlRevision -ne 'f7320141120f720aecc4c32be25586e7da9eb978') {
+    throw 'yaml-cpp must be at pinned 0.8.0 revision f7320141120f720aecc4c32be25586e7da9eb978. Existing sources were not changed.'
+}
+Invoke-Checked { & (Join-Path $VcpkgRoot 'vcpkg.exe') install zlib:x64-windows-static boost-beast:x64-windows-static nlohmann-json:x64-windows-static openssl:x64-windows-static libvpx:x64-windows-static dav1d:x64-windows-static }
 Write-Host "Dependencies ready. Set `$env:VCPKG_ROOT='$VcpkgRoot', then cmake --preset windows-x64."

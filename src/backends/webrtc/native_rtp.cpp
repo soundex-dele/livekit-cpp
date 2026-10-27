@@ -10,6 +10,12 @@
 #include <modules/rtp_rtcp/source/rtp_rtcp_impl2.h>
 #include <modules/rtp_rtcp/source/packet_sequencer.h>
 #include <modules/rtp_rtcp/source/rtp_format_vp8.h>
+#include <modules/rtp_rtcp/source/rtp_format_h264.h>
+#include <modules/rtp_rtcp/source/video_rtp_depacketizer_h264.h>
+#include <modules/rtp_rtcp/source/frame_object.h>
+#include <modules/video_coding/h26x_packet_buffer.h>
+#include <modules/video_coding/rtp_frame_reference_finder.h>
+#include <rtc_base/numerics/sequence_number_unwrapper.h>
 #include <modules/video_coding/nack_requester.h>
 #include <modules/congestion_controller/include/receive_side_congestion_controller.h>
 #include <modules/rtp_rtcp/source/rtcp_packet/remb.h>
@@ -204,10 +210,15 @@ struct NativeRtpSender::Impl : webrtc::RtpPacketSender,
     webrtc::RTPVideoHeaderVP8 header; header.InitRTPVideoHeaderVP8();
     header.pictureId=int16_t(picture_id & 0x7fff);
     webrtc::RtpPacketizer::PayloadSizeLimits limits; limits.max_payload_len=1100;
-    webrtc::RtpPacketizerVp8 packetizer({frame.data(),frame.size()},limits,header);
+    std::unique_ptr<webrtc::RtpPacketizer> packetizer;
+    if (config.video_codec==webrtc::kVideoCodecH264)
+      packetizer=std::make_unique<webrtc::RtpPacketizerH264>(webrtc::ArrayView<const uint8_t>(frame.data(),frame.size()),limits,webrtc::H264PacketizationMode::NonInterleaved);
+    else if (config.video_codec==webrtc::kVideoCodecVP8)
+      packetizer=std::make_unique<webrtc::RtpPacketizerVp8>(webrtc::ArrayView<const uint8_t>(frame.data(),frame.size()),limits,header);
+    else return false;
     std::vector<std::unique_ptr<webrtc::RtpPacketToSend>> batch;
     auto sequence=next_sequence;
-    while (packetizer.NumPackets()) {
+    while (packetizer->NumPackets()) {
       auto packet=sender->AllocatePacket({});
       packet->SetPayloadType(uint8_t(config.payload_type)); packet->SetTimestamp(timestamp);
       packet->SetSequenceNumber(sequence++);
@@ -215,7 +226,7 @@ struct NativeRtpSender::Impl : webrtc::RtpPacketSender,
       packet->set_allow_retransmission(true); packet->set_capture_time(now);
       packet->set_is_key_frame(frame.is_keyframe());
       packet->SetExtension<webrtc::VideoOrientation>(frame.rotation());
-      if (!packetizer.NextPacket(packet.get())) return false;
+      if (!packetizer->NextPacket(packet.get())) return false;
       batch.push_back(std::move(packet));
     }
     if (batch.empty()) return false;
@@ -267,11 +278,55 @@ webrtc::rtcp::SenderReport NativeRtpSender::translate_report(const webrtc::rtcp:
 
 struct NativeVideoAssembler::Impl {
   Frame callback;
-  webrtc::RtpVideoFrameAssembler assembler{webrtc::RtpVideoFrameAssembler::kVp8};
+  webrtc::RtpVideoFrameAssembler assembler;
+  struct H264 {
+    webrtc::VideoRtpDepacketizerH264 depacketizer;
+    webrtc::H26xPacketBuffer packets{true};
+    webrtc::RtpFrameReferenceFinder references;
+    webrtc::SeqNumUnwrapper<uint16_t> sequences;
+    webrtc::RtpFrameReferenceFinder::ReturnVector receive(const webrtc::RtpPacketReceived& rtp) {
+      webrtc::RtpFrameReferenceFinder::ReturnVector frames;
+      references.ClearTo(uint16_t(rtp.SequenceNumber()-2000));
+      if (!rtp.payload_size()) {
+        auto padding=packets.InsertPadding(rtp.SequenceNumber());
+        return references.PaddingReceived(rtp.SequenceNumber());
+      }
+      auto parsed=depacketizer.Parse(rtp.PayloadBuffer());
+      if (!parsed) return frames;
+      // Native parsing may rewrite SPS VUI for a local decoder. An SFU must
+      // preserve the publisher's NAL bytes; use parsed metadata but the original
+      // STAP-A/single-NAL payload. FU-A's native header removal is required.
+      if ((rtp.payload()[0]&0x1f)!=28) parsed->video_payload=rtp.PayloadBuffer();
+      parsed->video_header.is_last_packet_in_frame=rtp.Marker();
+      auto packet=std::make_unique<webrtc::H26xPacketBuffer::Packet>(rtp,sequences.Unwrap(rtp.SequenceNumber()),parsed->video_header);
+      packet->video_payload=std::move(parsed->video_payload);
+      auto assembled=packets.InsertPacket(std::move(packet));
+      webrtc::H26xPacketBuffer::Packet* first=nullptr;
+      std::vector<webrtc::ArrayView<const uint8_t>> payloads;
+      for (const auto& part:assembled.packets) {
+        if (part->is_first_packet_in_frame()) { first=part.get();payloads.clear(); }
+        payloads.emplace_back(part->video_payload);
+        if (!part->is_last_packet_in_frame() || !first) continue;
+        auto data=depacketizer.AssembleFrame(payloads);
+        if (!data) continue;
+        auto frame=std::make_unique<webrtc::RtpFrameObject>(first->seq_num(),part->seq_num(),part->marker_bit,0,0,0,
+          first->timestamp,0,webrtc::VideoSendTiming(),first->payload_type,webrtc::kVideoCodecH264,
+          part->video_header.rotation,part->video_header.content_type,first->video_header,
+          part->video_header.color_space,part->video_header.frame_instrumentation_data,webrtc::RtpPacketInfos(),std::move(data));
+        for (auto& ready:references.ManageFrame(std::move(frame))) frames.push_back(std::move(ready));
+      }
+      return frames;
+    }
+  };
+  std::unique_ptr<H264> h264;
   // M137's assembler does not extract the orientation extension itself.
   // Preserve it with native extension accessors, bounded by its packet window.
   std::deque<std::pair<uint32_t,webrtc::VideoRotation>> rotations;
-  explicit Impl(Frame frame) : callback(std::move(frame)) {}
+  explicit Impl(Frame frame,webrtc::VideoCodecType codec) : callback(std::move(frame)),
+      assembler(codec==webrtc::kVideoCodecH264 ? webrtc::RtpVideoFrameAssembler::kH264 : webrtc::RtpVideoFrameAssembler::kVp8) {
+    if (codec!=webrtc::kVideoCodecH264 && codec!=webrtc::kVideoCodecVP8) throw std::invalid_argument("Unsupported SFU assembler codec");
+    if (codec==webrtc::kVideoCodecH264) h264=std::make_unique<H264>();
+  }
   void receive(const webrtc::RtpPacketReceived& packet) {
     if (packet.Marker()) {
       auto rotation=webrtc::kVideoRotation_0;
@@ -279,17 +334,18 @@ struct NativeVideoAssembler::Impl {
       rotations.emplace_back(packet.Timestamp(),rotation);
       if (rotations.size()>2048) rotations.pop_front();
     }
-    for (auto& assembled:assembler.InsertPacket(packet)) {
-      auto frame=assembled.ExtractFrame();
+    auto deliver=[&](auto frame) {
       auto found=std::find_if(rotations.rbegin(),rotations.rend(),[&](const auto& entry) {
         return entry.first==frame->RtpTimestamp();
       });
       if (found!=rotations.rend()) frame->rotation_=found->second;
       callback(*frame);
-    }
+    };
+    if (h264) { for (auto& frame:h264->receive(packet)) deliver(std::move(frame)); }
+    else { for (auto& frame:assembler.InsertPacket(packet)) deliver(frame.ExtractFrame()); }
   }
 };
-NativeVideoAssembler::NativeVideoAssembler(Frame frame) : impl_(std::make_unique<Impl>(std::move(frame))) {}
+NativeVideoAssembler::NativeVideoAssembler(Frame frame,webrtc::VideoCodecType codec) : impl_(std::make_unique<Impl>(std::move(frame),codec)) {}
 NativeVideoAssembler::~NativeVideoAssembler()=default;
 void NativeVideoAssembler::receive(const webrtc::RtpPacketReceived& packet) { impl_->receive(packet); }
 
@@ -308,7 +364,7 @@ struct NativeRtpReceiver::Impl : webrtc::RtpPacketSinkInterface,webrtc::Transpor
   webrtc::Timestamp last_keyframe=webrtc::Timestamp::MinusInfinity();
   Impl(const webrtc::Environment& e,NativeReceiveConfig c,Media m,Rtcp r)
       : env(e),config(c),media(std::move(m)),rtcp(std::move(r)) {
-    if (!config.ssrc || !webrtc::TaskQueueBase::Current()) throw std::invalid_argument("SFU receiver requires signaled SSRC and native task queue");
+    if (!config.ssrc || config.clock_rate_hz<=0 || !webrtc::TaskQueueBase::Current()) throw std::invalid_argument("SFU receiver requires signaled SSRC, positive RTP clock and native task queue");
     statistics=webrtc::ReceiveStatistics::CreateThreadCompatible(&env.clock());
     webrtc::RtpRtcpInterface::Configuration native;
     native.audio=config.audio; native.receiver_only=true; native.local_media_ssrc=webrtc::CreateRandomNonZeroId();
@@ -328,7 +384,7 @@ struct NativeRtpReceiver::Impl : webrtc::RtpPacketSinkInterface,webrtc::Transpor
     // BUNDLE's transport map can reflect the last configured m-line. Identify
     // per-source extensions using the native map from this negotiated receiver.
     received.IdentifyExtensions(webrtc::RtpHeaderExtensionMap(config.extensions));
-    received.set_payload_type_frequency(config.audio ? 48000 : 90000);
+    received.set_payload_type_frequency(config.clock_rate_hz);
     statistics->OnRtpPacket(received);
     if (nack) nack->OnReceivedPacket(received.SequenceNumber(),received.recovered());
     if (received.payload_size() || !config.audio) media(received);

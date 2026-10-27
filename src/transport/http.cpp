@@ -1,7 +1,11 @@
 #include "lk/http.hpp"
+#include "lk/join_request.hpp"
+#include "lk/studio_admission.hpp"
 #include <boost/beast.hpp>
 #include <google/protobuf/dynamic_message.h>
 #include <deque>
+#include <algorithm>
+#include <array>
 #include <iostream>
 namespace lk {
 namespace {
@@ -51,19 +55,38 @@ class WebSocketSession : public SignalSink, public std::enable_shared_from_this<
  public:
   WebSocketSession(beast::tcp_stream stream, Rooms& rooms, std::shared_ptr<ConnectionCount> count)
       : socket_(std::move(stream)), rooms_(rooms), count_(std::move(count)) {}
-  void run(Request request, Claims claims, bool auto_subscribe, bool reconnect) {
-    request_ = std::move(request); claims_ = std::move(claims);
+  void run(Request request, Claims claims, bool auto_subscribe, bool reconnect, std::optional<livekit::JoinRequest> join_request) {
+    request_ = std::move(request); claims_ = std::move(claims); join_request_ = std::move(join_request);
     beast::get_lowest_layer(socket_).expires_never();
     socket_.set_option(ws::stream_base::timeout::suggested(beast::role_type::server));
-    socket_.read_message_max(1024 * 1024);
+    socket_.read_message_max(2 * 1024 * 1024);
     socket_.async_accept(request_, [self = shared_from_this(), auto_subscribe, reconnect](beast::error_code error) {
       if (error) return self->finish();
       try {
         if (reconnect) {
-          livekit::SignalResponse response; response.mutable_leave()->set_reason(livekit::STATE_MISMATCH); response.mutable_leave()->set_action(livekit::LeaveRequest::RECONNECT); response.mutable_leave()->set_can_reconnect(true);
-          self->send(response); self->close(); return;
+          self->participant_ = self->rooms_.resume(self->claims_, self);
+          if (!self->participant_) {
+            livekit::SignalResponse response; response.mutable_leave()->set_reason(livekit::STATE_MISMATCH); response.mutable_leave()->set_action(livekit::LeaveRequest::RECONNECT); response.mutable_leave()->set_can_reconnect(true);
+            self->send(response); self->close(); return;
+          }
+        } else {
+          self->participant_ = self->rooms_.join(self->claims_, auto_subscribe, self, self->join_request_ ? std::max(0, self->join_request_->client_info().protocol()) : -1);
         }
-        self->participant_ = self->rooms_.join(self->claims_, auto_subscribe, self); self->read();
+        if (self->join_request_) {
+          livekit::SignalRequest message;
+          if (reconnect && self->join_request_->has_sync_state()) {
+            *message.mutable_sync_state() = self->join_request_->sync_state();
+            self->rooms_.signal(self->participant_, message); message.Clear();
+          }
+          if (!reconnect) for (const auto& track : self->join_request_->add_track_requests()) {
+            *message.mutable_add_track() = track; self->rooms_.signal(self->participant_, message); message.Clear();
+          }
+          if (self->join_request_->has_publisher_offer()) {
+            *message.mutable_offer() = self->join_request_->publisher_offer(); self->rooms_.signal(self->participant_, message);
+          }
+          self->join_request_.reset();
+        }
+        self->read();
       } catch (const std::exception& e) {
         std::cerr << "Join rejected: " << e.what() << '\n';
         livekit::SignalResponse res; res.mutable_leave()->set_reason(livekit::JOIN_FAILURE); self->send(res); self->close();
@@ -84,6 +107,7 @@ class WebSocketSession : public SignalSink, public std::enable_shared_from_this<
   void read() {
     socket_.async_read(buffer_, [self = shared_from_this()](beast::error_code error, size_t) {
       if (error) return self->finish();
+      if (!self->participant_ || self->participant_->sink.lock().get() != self.get()) return self->finish();
       try {
         livekit::SignalRequest request; auto bytes = beast::buffers_to_string(self->buffer_.data());
         if (self->socket_.got_text()) request = from_json<livekit::SignalRequest>(Json::parse(bytes));
@@ -113,13 +137,14 @@ class WebSocketSession : public SignalSink, public std::enable_shared_from_this<
     if (finished_) return;
     finished_ = true;
     beast::error_code ignored; beast::get_lowest_layer(socket_).socket().close(ignored);
-    if (participant_ && !participant_->closed) rooms_.leave(participant_, livekit::SIGNAL_CLOSE);
+    rooms_.signal_closed(participant_, this);
   }
   ws::stream<beast::tcp_stream> socket_;
   Rooms& rooms_;
   std::shared_ptr<ConnectionCount> count_;
   Request request_;
   Claims claims_;
+  std::optional<livekit::JoinRequest> join_request_;
   std::shared_ptr<Participant> participant_;
   beast::flat_buffer buffer_;
   std::deque<std::string> queue_;
@@ -129,9 +154,9 @@ class WebSocketSession : public SignalSink, public std::enable_shared_from_this<
 class HttpSession : public std::enable_shared_from_this<HttpSession> {
  public:
   HttpSession(tcp::socket socket, Rooms& rooms, const Auth& auth, std::shared_ptr<size_t> connections)
-      : stream_(std::move(socket)), rooms_(rooms), auth_(auth), count_(std::make_shared<ConnectionCount>(std::move(connections))) {}
+      : stream_(std::move(socket)), rooms_(rooms), auth_(auth), count_(std::make_shared<ConnectionCount>(std::move(connections))), rpc_deadline_(stream_.get_executor()) {}
   void run() {
-    stream_.expires_after(std::chrono::seconds(10)); parser_.body_limit(1024 * 1024); parser_.header_limit(48 * 1024);
+    stream_.expires_after(std::chrono::seconds(10)); parser_.body_limit(10 * 1024 * 1024); parser_.header_limit(1024 * 1024);
     http::async_read(stream_, buffer_, parser_, [self = shared_from_this()](beast::error_code error, size_t) {
       if (error) return;
       self->handle(parser_request(self));
@@ -140,32 +165,118 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
  private:
   static Request parser_request(const std::shared_ptr<HttpSession>& self) { return self->parser_.release(); }
   void respond(int status, std::string body, const std::string& type = "application/json") {
+    stream_.expires_after(std::chrono::seconds(10));
     response_ = std::make_shared<http::response<http::string_body>>(static_cast<http::status>(status), 11);
     response_->set(http::field::content_type, type); response_->set(http::field::server, "livekit-cpp/0.1.0");
     response_->set(http::field::access_control_allow_origin, "*");
-    response_->set(http::field::access_control_allow_headers, "Authorization, Content-Type");
+    response_->set(http::field::access_control_allow_headers, "Authorization, Content-Type, X-Twirp-Timeout-Ms");
     response_->set(http::field::access_control_allow_methods, "GET, POST, OPTIONS");
     response_->keep_alive(false); response_->body() = std::move(body); response_->prepare_payload();
     http::async_write(stream_, *response_, [self = shared_from_this()](beast::error_code, size_t) {
       beast::error_code ignored; self->stream_.socket().shutdown(tcp::socket::shutdown_send, ignored);
     });
   }
+  void respond_api(const google::protobuf::Descriptor* descriptor, const Json& output, bool binary) {
+    google::protobuf::DynamicMessageFactory factory;
+    std::unique_ptr<google::protobuf::Message> proto(factory.GetPrototype(descriptor)->New());
+    auto status = google::protobuf::util::JsonStringToMessage(output.dump(), proto.get());
+    if (!status.ok()) throw std::runtime_error(status.ToString());
+    if (binary) { respond(200, proto->SerializeAsString(), "application/protobuf"); return; }
+    google::protobuf::util::JsonPrintOptions options;
+    options.preserve_proto_field_names = true;
+    options.always_print_primitive_fields = true;
+    std::string body;
+    status = google::protobuf::util::MessageToJsonString(*proto, &body, options);
+    if (!status.ok()) throw std::runtime_error(status.ToString());
+    respond(200, std::move(body));
+  }
+  void watch_rpc_client() {
+    stream_.socket().async_read_some(boost::asio::buffer(rpc_read_buffer_),
+      [self = shared_from_this()](beast::error_code error, size_t) {
+        if (!self->rpc_waiting_) return;
+        if (!error) { self->watch_rpc_client(); return; }
+        self->rpc_waiting_ = false;
+        if (self->cancel_rpc_) self->cancel_rpc_();
+        self->cancel_rpc_ = {};
+        self->rpc_deadline_.cancel();
+        beast::error_code ignored; self->stream_.socket().close(ignored);
+      });
+  }
+  void participant_api(const std::string& method, const Json& input, const Claims& claims,
+                   const google::protobuf::Descriptor* output_type, bool binary, const Request& request) {
+    rpc_waiting_ = true;
+    stream_.expires_never();
+    try {
+      auto cancel = rooms_.participant_api(method, input, claims,
+          [self = shared_from_this(), output_type, binary](RpcRequests::Result result) {
+        if (!self->rpc_waiting_) return;
+        self->rpc_waiting_ = false;
+        self->cancel_rpc_ = {};
+        self->rpc_deadline_.cancel();
+        beast::error_code ignored; self->stream_.socket().cancel(ignored);
+        if (auto error = std::get_if<Error>(&result)) {
+          self->respond(error->status, error->body().dump());
+          return;
+        }
+        try { self->respond_api(output_type, Json{{"payload", std::get<std::string>(result)}}, binary); }
+        catch (const std::exception&) { self->respond(500, "{\"code\":\"internal\",\"msg\":\"Internal server error\"}"); }
+      });
+      if (!rpc_waiting_) { cancel(); return; }
+      cancel_rpc_ = std::move(cancel);
+    } catch (...) { rpc_waiting_ = false; throw; }
+    watch_rpc_client();
+    const std::string timeout(request["X-Twirp-Timeout-Ms"]);
+    if (!timeout.empty()) {
+      try {
+        size_t end = 0;
+        const auto value = std::stoll(timeout, &end);
+        if (end != timeout.size()) return; // Go ignores invalid timeout headers.
+        // RPC response_timeout_ms is uint32; a larger header cannot win its deadline.
+        rpc_deadline_.expires_after(std::chrono::milliseconds(std::clamp<int64_t>(value, 0, UINT32_MAX)));
+        rpc_deadline_.async_wait([self = shared_from_this()](beast::error_code error) {
+          if (error || !self->rpc_waiting_) return;
+          self->rpc_waiting_ = false;
+          if (self->cancel_rpc_) self->cancel_rpc_();
+          self->cancel_rpc_ = {};
+          beast::error_code ignored; self->stream_.socket().cancel(ignored);
+          self->respond(408, "{\"code\":\"canceled\",\"msg\":\"request canceled\"}");
+        });
+      } catch (const std::invalid_argument&) {} catch (const std::out_of_range&) {}
+    }
+  }
   void handle(Request request) {
     try {
       Target target(std::string(request.target()));
       if (request.method() == http::verb::options) { respond(204, ""); return; }
       if ((target.path == "/" || target.path == "/healthz") && request.method() == http::verb::get) { respond(200, "{\"status\":\"ok\",\"version\":\"0.1.0\"}"); return; }
-      if (target.path == "/rtc" || target.path == "/rtc/validate") {
+      if (target.path == "/rtc" || target.path == "/rtc/validate" || target.path == "/rtc/v1" || target.path == "/rtc/v1/validate") {
         if (request.method() != http::verb::get) throw Error(405, "bad_route", "GET required");
         auto claims = authenticate(request, target, auth_);
         if (!claims.join || claims.room.empty() || claims.identity.empty()) throw Error(403, "permission_denied", "Room join grant and identity required");
-        if (target.query.contains("join_request")) throw Error(501, "unimplemented", "Single PeerConnection signaling is not supported; use /rtc dual PeerConnection mode");
-        if (target.path == "/rtc/validate") { respond(200, "success", "text/plain"); return; }
+        if (!claims.studio_grant.empty() && !studio_admitted_) {
+          studio_admission(stream_.get_executor(), claims, [self=shared_from_this(), request=std::move(request)](bool allowed) mutable {
+            if (!allowed) { self->respond(401, "{\"code\":\"unauthenticated\",\"msg\":\"Studio admission expired or revoked\"}"); return; }
+            self->studio_admitted_ = true; self->handle(std::move(request));
+          });
+          return;
+        }
+        std::optional<livekit::JoinRequest> join_request;
+        if (auto encoded = target.query.find("join_request"); encoded != target.query.end() && !encoded->second.empty())
+          join_request = decode_join_request(encoded->second);
+        else if (target.path.starts_with("/rtc/v1")) throw Error(400, "invalid_argument", "join_request is required");
+        if (join_request) {
+          if ((!join_request->metadata().empty() || !join_request->participant_attributes().empty()) && !claims.update_metadata)
+            throw Error(401, "unauthenticated", "permission denied");
+          if (!join_request->metadata().empty()) claims.metadata = join_request->metadata();
+          for (const auto& [key, value] : join_request->participant_attributes()) if (!value.empty()) claims.attributes[key] = value;
+        }
+        if (target.path.ends_with("/validate")) { respond(200, "success", "text/plain"); return; }
         if (!ws::is_upgrade(request)) throw Error(400, "invalid_argument", "WebSocket upgrade required");
         auto session = std::make_shared<WebSocketSession>(std::move(stream_), rooms_, count_);
         bool auto_subscribe = !target.query.contains("auto_subscribe") || target.query["auto_subscribe"] != "0";
         bool reconnect = target.query.contains("reconnect") && target.query["reconnect"] == "1";
-        session->run(std::move(request), std::move(claims), auto_subscribe, reconnect); return;
+        if (join_request) { auto_subscribe = join_request->connection_settings().auto_subscribe(); reconnect = join_request->reconnect(); }
+        session->run(std::move(request), std::move(claims), auto_subscribe, reconnect, std::move(join_request)); return;
       }
       if (target.path == "/metrics") {
         auto c = authenticate(request, target, auth_); if (!c.list) throw Error(403, "permission_denied", "roomList required");
@@ -182,22 +293,27 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
       if (!descriptor) throw Error(404, "bad_route", "Unknown RoomService method");
       google::protobuf::DynamicMessageFactory factory;
       bool binary = std::string(request[http::field::content_type]).starts_with("application/protobuf");
-      Json input;
+      std::unique_ptr<google::protobuf::Message> input_proto(factory.GetPrototype(descriptor->input_type())->New());
       if (binary) {
-        std::unique_ptr<google::protobuf::Message> proto(factory.GetPrototype(descriptor->input_type())->New());
-        if (!proto->ParseFromString(request.body())) throw Error(400, "malformed", "Invalid protobuf request"); input = to_json(*proto);
+        if (!input_proto->ParseFromString(request.body())) throw Error(400, "malformed", "Invalid protobuf request");
       } else {
         if (!std::string(request[http::field::content_type]).starts_with("application/json")) throw Error(415, "bad_route", "Use application/json or application/protobuf");
-        input = Json::parse(request.body());
+        // Twirp's Go JSON decoder discards unknown fields and accepts proto
+        // field names as well as lowerCamelCase. Normalize once so both wire
+        // formats reach the same API validation, with malformed type errors
+        // reported before permission and room-state checks.
+        google::protobuf::util::JsonParseOptions options;
+        options.ignore_unknown_fields = true;
+        auto status = google::protobuf::util::JsonStringToMessage(request.body(), input_proto.get(), options);
+        if (!status.ok()) throw Error(400, "malformed", "Invalid JSON request");
       }
-      auto output = rooms_.api(method, input, claims);
-      if (binary) {
-        std::unique_ptr<google::protobuf::Message> proto(factory.GetPrototype(descriptor->output_type())->New());
-        auto status = google::protobuf::util::JsonStringToMessage(output.dump(), proto.get());
-        if (!status.ok()) throw std::runtime_error(status.ToString());
-        respond(200, proto->SerializeAsString(), "application/protobuf");
-      } else respond(200, output.dump());
-    } catch (const Error& error) { respond(error.status, Json{{"code", error.code}, {"msg", error.what()}}.dump()); }
+      if (method == "PerformRpc" || method == "ForwardParticipant" || method == "MoveParticipant") {
+        participant_api(method, to_json(*input_proto), claims,
+                    descriptor->output_type(), binary, request);
+        return;
+      }
+      respond_api(descriptor->output_type(), rooms_.api(method, to_json(*input_proto), claims), binary);
+    } catch (const Error& error) { respond(error.status, error.body().dump()); }
     catch (const Json::exception&) { respond(400, "{\"code\":\"malformed\",\"msg\":\"Invalid JSON request\"}"); }
     catch (const std::exception& e) { std::cerr << "HTTP operation failed: " << e.what() << '\n'; respond(500, "{\"code\":\"internal\",\"msg\":\"Internal server error\"}"); }
   }
@@ -208,6 +324,11 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
   beast::flat_buffer buffer_;
   http::request_parser<http::string_body> parser_;
   std::shared_ptr<http::response<http::string_body>> response_;
+  boost::asio::steady_timer rpc_deadline_;
+  RpcRequests::Cancel cancel_rpc_;
+  std::array<char, 512> rpc_read_buffer_{};
+  bool rpc_waiting_ = false;
+  bool studio_admitted_ = false;
 };
 }
 HttpServer::HttpServer(boost::asio::io_context& io, Rooms& rooms, const Config& config)

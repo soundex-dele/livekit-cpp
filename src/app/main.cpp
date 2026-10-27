@@ -1,30 +1,43 @@
 #include "lk/http.hpp"
 #include <boost/asio/signal_set.hpp>
 #include <iostream>
+#include <cstdlib>
 #if defined(_WIN32)
 #include <rtc_base/win32_socket_init.h>
 #endif
 int main(int argc, char** argv) {
   try {
     lk::Config config; bool token = false, dev = false;
-    std::string path, room, identity, bind; int port = 0;
+    std::string path, room, identity, bind, body;
+    std::optional<std::string> keys;
+    if (const auto* env=std::getenv("LIVEKIT_CONFIG")) body=env;
+    if (const auto* env=std::getenv("LIVEKIT_KEYS")) keys=env;
+    int port = 0;
     for (int i = 1; i < argc; ++i) {
       std::string arg = argv[i];
       auto value = [&]() -> std::string { if (++i >= argc) throw std::runtime_error("Missing value for " + arg); return argv[i]; };
       if (arg == "--dev") dev = true;
       else if (arg == "--config") path = value();
-      else if (arg == "--bind") bind = value();
+      else if (arg == "--config-body") body = value();
+      else if (arg == "--keys") keys = value();
+      else if (arg == "--bind") {
+        if (!bind.empty()) throw std::runtime_error("Multiple bind addresses are not yet supported");
+        bind = value();
+      }
       else if (arg == "--port") { auto s = value(); size_t n = 0; port = std::stoi(s, &n); if (n != s.size() || port < 1 || port > 65535) throw std::runtime_error("Invalid port"); }
       else if (arg == "--token") token = true;
       else if (arg == "--room") room = value();
       else if (arg == "--identity") identity = value();
       else if (arg == "--version") { std::cout << "livekit-cpp 0.1.0\n"; return 0; }
-      else if (arg == "--help") { std::cout << "livekit-server [--dev | --config file.json] [--bind IP] [--port 7880]\n"
+      else if (arg == "--help") { std::cout << "livekit-server [--dev] [--config file.yaml | --config-body YAML] [--keys YAML] [--bind IP] [--port 7880]\n"
+        "LIVEKIT_CONFIG supplies config-body; LIVEKIT_KEYS supplies keys. Explicit flags override their environment values.\n"
         "livekit-server --dev --token --room demo --identity alice\n"; return 0; }
       else throw std::runtime_error("Unknown option: " + arg);
     }
-    if (!path.empty()) config = lk::Config::load(path);
-    if (dev) { if (!path.empty()) throw std::runtime_error("Use either --dev or --config"); config.keys = {{"devkey", "secret"}}; }
+    if (!body.empty()) config = lk::Config::parse(body,false);
+    else if (!path.empty()) config = lk::Config::load(path,false);
+    if (keys) config.keys=lk::Config::parse_keys(*keys);
+    if (dev && config.keys.empty()) config.keys = {{"devkey", "secret"}};
     if (!bind.empty()) config.bind = bind;
     if (port) config.port = static_cast<uint16_t>(port);
     config.validate();
@@ -37,7 +50,7 @@ int main(int argc, char** argv) {
     webrtc::WinsockInitializer winsock; if (winsock.error()) throw std::runtime_error("Winsock initialization failed");
 #endif
     boost::asio::io_context io;
-    lk::RtcRuntime rtc;
+    lk::RtcRuntime rtc(config.media_mode=="sfu");
     lk::Rooms rooms(io, rtc, config);
     lk::HttpServer server(io, rooms, config);
     boost::asio::signal_set signals(io, SIGINT, SIGTERM);

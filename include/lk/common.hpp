@@ -11,7 +11,14 @@ inline int64_t now_ms() { return std::chrono::duration_cast<std::chrono::millise
 struct Error : std::runtime_error {
   int status;
   std::string code;
-  Error(int status, std::string code, std::string message) : runtime_error(std::move(message)), status(status), code(std::move(code)) {}
+  Json meta;
+  Error(int status, std::string code, std::string message, Json meta = Json::object())
+      : runtime_error(std::move(message)), status(status), code(std::move(code)), meta(std::move(meta)) {}
+  Json body() const {
+    Json result{{"code", code}, {"msg", what()}};
+    if (!meta.empty()) result["meta"] = meta;
+    return result;
+  }
 };
 inline Json to_json(const google::protobuf::Message& message) {
   std::string out;

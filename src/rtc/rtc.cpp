@@ -1,7 +1,10 @@
+#include <pc/session_description.h>
+#include <pc/rtp_transceiver.h>
 #include "lk/rtc.hpp"
 #include "lk/headless_audio.hpp"
 #include "lk/sfu.hpp"
 #include "lk/codec_audit.hpp"
+#include "lk/media_codec.hpp"
 #include <boost/asio/post.hpp>
 #include <api/audio/audio_device.h>
 #include <api/create_peerconnection_factory.h>
@@ -51,7 +54,7 @@ class CreateObserver : public webrtc::CreateSessionDescriptionObserver {
  private: std::function<void(std::string, std::string)> cb_;
 };
 }
-RtcRuntime::RtcRuntime() {
+RtcRuntime::RtcRuntime(bool packet_forwarding) {
   const char* native_log=std::getenv("LK_WEBRTC_LOG");
   webrtc::LogMessage::LogToDebug(native_log && std::string_view(native_log)=="info" ? webrtc::LS_INFO : webrtc::LS_ERROR);
   ssl_ = webrtc::InitializeSSL();
@@ -72,8 +75,8 @@ RtcRuntime::RtcRuntime() {
   deps.audio_encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
   deps.audio_decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
   codec_audit = std::make_shared<CodecAudit>();
-  deps.video_encoder_factory = audited_video_encoders(codec_audit);
-  deps.video_decoder_factory = audited_video_decoders(codec_audit);
+  deps.video_encoder_factory = audited_video_encoders(codec_audit,packet_forwarding);
+  deps.video_decoder_factory = audited_video_decoders(codec_audit,packet_forwarding);
   // Received PCM already passed the publisher's processing. Keep server-side
   // echo cancellation, noise suppression and gain control out of the relay.
   webrtc::EnableMedia(deps);
@@ -116,10 +119,10 @@ struct Peer::Channel : webrtc::DataChannelObserver {
     }
   }
 };
-Peer::Peer(boost::asio::io_context& io, RtcRuntime& runtime, bool subscriber, PeerEvents events)
-    : io_(io), runtime_(runtime), subscriber_(subscriber), events_(std::move(events)) {}
-std::shared_ptr<Peer> Peer::create(boost::asio::io_context& io, RtcRuntime& runtime, const Config& config, bool subscriber, PeerEvents events) {
-  auto peer = std::shared_ptr<Peer>(new Peer(io, runtime, subscriber, std::move(events)));
+Peer::Peer(boost::asio::io_context& io, RtcRuntime& runtime, bool subscriber, PeerEvents events, int single_pc_protocol)
+    : io_(io), runtime_(runtime), subscriber_(subscriber), single_pc_protocol_(single_pc_protocol), events_(std::move(events)) {}
+std::shared_ptr<Peer> Peer::create(boost::asio::io_context& io, RtcRuntime& runtime, const Config& config, bool subscriber, PeerEvents events, int single_pc_protocol) {
+  auto peer = std::shared_ptr<Peer>(new Peer(io, runtime, subscriber, std::move(events), single_pc_protocol));
   peer->initialize(config); return peer;
 }
 void Peer::initialize(const Config& config) {
@@ -134,11 +137,12 @@ void Peer::initialize(const Config& config) {
   auto result = runtime_.factory->CreatePeerConnectionOrError(rtc, webrtc::PeerConnectionDependencies(this));
   if (!result.ok()) throw std::runtime_error(std::string(result.error().message()));
   pc_ = result.MoveValue();
-  if (config.media_mode == "sfu") sfu_ = std::make_unique<SfuSession>(*runtime_.sfu, subscriber_);
-  if (subscriber_) {
+  if (config.media_mode == "sfu") sfu_ = std::make_unique<SfuSession>(*runtime_.sfu, subscriber_, single_pc_protocol_ >= 0);
+  if (subscriber_ || single_pc_protocol_ > 17) {
     for (bool reliable : {true, false}) {
       webrtc::DataChannelInit init;
       init.ordered = reliable;
+      if (single_pc_protocol_ > 17) { init.negotiated = true; init.id = reliable ? 100 : 101; }
       if (!reliable) init.maxRetransmits = 0;
       auto channel = pc_->CreateDataChannelOrError(reliable ? "_reliable" : "_lossy", &init);
       if (!channel.ok()) throw std::runtime_error(std::string(channel.error().message()));
@@ -158,16 +162,17 @@ void Peer::close() {
 void Peer::fail(const std::string& message) {
   if (!closed_ && events_.error) events_.error(message);
 }
-void Peer::remote_description(const std::string& type, const std::string& sdp) {
+void Peer::remote_description(const std::string& type, const std::string& sdp, uint32_t id) {
   if (closed_) return;
   if ((subscriber_ && type != "answer") || (!subscriber_ && type != "offer")) throw Error(400, "invalid_argument", "Unexpected SDP type");
   webrtc::SdpParseError error;
   auto desc = webrtc::CreateSessionDescription(subscriber_ ? webrtc::SdpType::kAnswer : webrtc::SdpType::kOffer, sdp, &error);
   if (!desc) throw Error(400, "invalid_argument", "Invalid SDP: " + error.description);
   if (sfu_) sfu_->detach();
+  if (single_pc_protocol_ >= 0) { negotiating_ = true; dirty_ = false; }
   auto weak = weak_from_this();
-  auto observer = webrtc::make_ref_counted<SetObserver>([weak, io = &io_](std::string error) {
-    boost::asio::post(*io, [weak, error] {
+  auto observer = webrtc::make_ref_counted<SetObserver>([weak, io = &io_, id](std::string error) {
+    boost::asio::post(*io, [weak, error, id] {
       auto p = weak.lock(); if (!p || p->closed_) return;
       if (!error.empty()) return p->fail(error);
       p->remote_ready_ = true;
@@ -181,12 +186,13 @@ void Peer::remote_description(const std::string& type, const std::string& sdp) {
         if (p->events_.negotiated) p->events_.negotiated();
         if (p->dirty_) p->negotiate();
       }
-      else p->create_description(false);
+      else p->create_description(false, id);
     });
   });
   pc_->SetRemoteDescription(observer.get(), desc.release());
 }
-void Peer::create_description(bool offer) {
+void Peer::create_description(bool offer, uint32_t id) {
+  if (offer) id = ++next_offer_id_;
   if (closed_) return;
   if (sfu_) {
     // Advertise only the packet adapter's supported codec contract. Native
@@ -196,15 +202,32 @@ void Peer::create_description(bool offer) {
       if (transceiver->stopped()) continue;
       auto capabilities = runtime_.factory->GetRtpReceiverCapabilities(transceiver->media_type());
       std::vector<webrtc::RtpCodecCapability> codecs;
+      auto source=sender_codecs_.find(transceiver->sender()->id());
+      std::optional<webrtc::RtpCodecParameters> selected;
+      if (source!=sender_codecs_.end()) selected=source->second;
+      else if (!offer && pc_->remote_description() && transceiver->mid()) {
+        const auto* content=pc_->remote_description()->description()->GetContentByName(*transceiver->mid());
+        auto requested=publication_codecs_.find(transceiver->receiver()->track()->id());
+        if (content) for (const auto& offered:content->media_description()->codecs()) {
+          webrtc::RtpCodecParameters candidate;
+          candidate.name=offered.name;candidate.clock_rate=offered.clockrate;
+          if (transceiver->media_type()==webrtc::MediaType::AUDIO) candidate.num_channels=int(offered.channels);
+          candidate.parameters=offered.params;candidate.payload_type=offered.id;
+          if (forwarding_codec(candidate) && (requested==publication_codecs_.end() || codec_name(candidate.name)==requested->second)) {
+            selected=std::move(candidate);break;
+          }
+        }
+      }
       for (const auto& codec : capabilities.codecs)
-        if (codec.name == "opus" || codec.name == "VP8" || codec.name == "rtx") codecs.push_back(codec);
+        if (codec_name(codec.name)=="rtx" || (forwarding_codec(codec) &&
+            (!selected || same_forwarding_codec(codec,*selected)))) codecs.push_back(codec);
       auto result = transceiver->SetCodecPreferences(codecs);
       if (!result.ok()) { fail(std::string(result.message())); return; }
     }
   }
   auto weak = weak_from_this();
-  auto observer = webrtc::make_ref_counted<CreateObserver>([weak, io = &io_, offer](std::string sdp, std::string error) {
-    boost::asio::post(*io, [weak, offer, sdp, error]() mutable {
+  auto observer = webrtc::make_ref_counted<CreateObserver>([weak, io = &io_, offer, id](std::string sdp, std::string error) {
+    boost::asio::post(*io, [weak, offer, sdp, error, id]() mutable {
       auto p = weak.lock(); if (!p || p->closed_) return;
       if (!error.empty()) return p->fail(error);
       auto desc = webrtc::CreateSessionDescription(offer ? webrtc::SdpType::kOffer : webrtc::SdpType::kAnswer, sdp);
@@ -213,14 +236,23 @@ void Peer::create_description(bool offer) {
         try { p->sfu_->prepare_answer(p->pc_,*desc); desc->ToString(&sdp); }
         catch (const std::exception& e) { p->fail(e.what()); return; }
       }
-      auto set = webrtc::make_ref_counted<SetObserver>([weak, io = &p->io_, offer, sdp](std::string error) {
-        boost::asio::post(*io, [weak, offer, sdp, error] {
+      auto set = webrtc::make_ref_counted<SetObserver>([weak, io = &p->io_, offer, sdp, id](std::string error) {
+        boost::asio::post(*io, [weak, offer, sdp, error, id] {
           if (auto p = weak.lock(); p && !p->closed_) {
             if (!error.empty()) p->fail(error);
             else {
               try { if (p->sfu_) p->sfu_->refresh(p->pc_); }
               catch (const std::exception& e) { p->fail(e.what()); return; }
-              p->events_.description(offer ? "offer" : "answer", sdp);
+              p->deliver_tracks();
+              if (p->closed_) return;
+              p->events_.description(offer ? "offer" : "answer", sdp, id);
+              if (!offer && p->single_pc_protocol_ >= 0) {
+                p->negotiating_ = false;
+                if (p->events_.negotiated) p->events_.negotiated();
+                // Answering the initial offer can leave server-added tracks
+                // without a matching client media section. Request only new ones.
+                p->negotiate();
+              }
             }
           }
         });
@@ -233,9 +265,36 @@ void Peer::create_description(bool offer) {
   if (offer) pc_->CreateOffer(observer.get(), options); else pc_->CreateAnswer(observer.get(), options);
 }
 void Peer::negotiate() {
-  if (closed_ || !subscriber_) return;
+  if (closed_) return;
+  if (single_pc_protocol_ >= 0) {
+    if (negotiating_ || !remote_ready_) { dirty_ = true; return; }
+    uint32_t audio = 0, video = 0;
+    for (const auto& t : pc_->GetTransceivers()) {
+      if (t->stopped() || t->mid() || !t->sender()->track()) continue;
+      if (!requested_senders_.insert(t->sender()->id()).second) continue;
+      if (t->media_type() == webrtc::MediaType::AUDIO) ++audio; else ++video;
+    }
+    if ((audio || video || dirty_) && events_.media_sections) events_.media_sections(audio, video);
+    dirty_ = false;
+    return;
+  }
+  if (!subscriber_) return;
   if (negotiating_) { dirty_ = true; return; }
   negotiating_ = true; dirty_ = false; create_description(true);
+}
+void Peer::restart_ice() {
+  if (closed_) return;
+  if (single_pc_protocol_ >= 0) {
+    // The client restarts this PC. Reissue any media-section request lost on
+    // the old signal transport after its next offer has been answered.
+    requested_senders_.clear(); dirty_ = true; return;
+  }
+  if (!subscriber_) return;
+  pc_->RestartIce();
+  // A previously sent offer/answer may have been lost with the signal socket.
+  // CreateOffer can replace a local offer; do not wait forever for its answer.
+  negotiating_ = false;
+  negotiate();
 }
 void Peer::ice_candidate(const std::string& json) {
   if (closed_) return;
@@ -249,7 +308,7 @@ void Peer::ice_candidate(const std::string& json) {
   std::unique_ptr<webrtc::IceCandidateInterface> c(webrtc::CreateIceCandidate(j.value("sdpMid", ""), j.value("sdpMLineIndex", 0), j.at("candidate").get<std::string>(), &error));
   if (!c || !pc_->AddIceCandidate(c.get())) throw Error(400, "invalid_argument", "Invalid ICE candidate");
 }
-void Peer::add_track(const std::string& sid, const std::string& participant_sid, Track remote) {
+void Peer::add_track(const std::string& sid, const std::string& participant_sid, Track remote, const std::optional<webrtc::RtpCodecParameters>& codec) {
   if (closed_ || senders_.contains(sid)) return;
   Track local;
   if (remote->kind() == "audio") {
@@ -259,19 +318,68 @@ void Peer::add_track(const std::string& sid, const std::string& participant_sid,
     auto track = static_cast<webrtc::VideoTrackInterface*>(remote.get());
     local = runtime_.factory->CreateVideoTrack(webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface>(track->GetSource()), sid);
   }
-  auto result = pc_->AddTrack(local, {participant_sid + "|" + sid});
-  if (!result.ok()) { fail(std::string(result.error().message())); return; }
-  senders_[sid] = result.MoveValue();
+  const std::string stream_id = participant_sid + "|" + sid;
+  if (single_pc_protocol_ >= 0) {
+    // AddTrack may reuse a recvonly server transceiver whose remote side is
+    // sendonly. That peer cannot receive our subscription on that media section.
+    // Reuse only client receive sections; otherwise request a new one.
+    for (const auto& transceiver : pc_->GetTransceivers()) {
+      if (transceiver->stopped() || transceiver->sender()->track() ||
+          (transceiver->media_type() == webrtc::MediaType::AUDIO) != (local->kind() == "audio")) continue;
+      const auto remote_direction = runtime_.signaling_->BlockingCall([&]() -> std::optional<webrtc::RtpTransceiverDirection> {
+        auto* proxy = static_cast<webrtc::RtpTransceiverProxyWithInternal<webrtc::RtpTransceiver>*>(transceiver.get());
+        // Preserve AddTrack's native no-reuse-after-send rule: reusing an old
+        // sender also reuses its MSID/SSRC and breaks new publication identity.
+        if (proxy->internal()->has_ever_been_used_to_send()) return {};
+        if (!pc_->remote_description() || !transceiver->mid()) return {};
+        const auto* content = pc_->remote_description()->description()->GetContentByName(*transceiver->mid());
+        if (!content || content->rejected || !content->media_description()) return {};
+        return content->media_description()->direction();
+      });
+      if (!remote_direction || (*remote_direction != webrtc::RtpTransceiverDirection::kRecvOnly &&
+                                *remote_direction != webrtc::RtpTransceiverDirection::kSendRecv)) continue;
+      auto sender = transceiver->sender();
+      if (!sender->SetTrack(local.get())) { fail("Cannot attach subscription track"); return; }
+      sender->SetStreams({stream_id});
+      auto result = transceiver->SetDirectionWithError(*remote_direction == webrtc::RtpTransceiverDirection::kSendRecv
+          ? webrtc::RtpTransceiverDirection::kSendRecv : webrtc::RtpTransceiverDirection::kSendOnly);
+      if (!result.ok()) { fail(std::string(result.message())); return; }
+      senders_[sid] = sender; break;
+    }
+    if (!senders_.contains(sid)) {
+      webrtc::RtpTransceiverInit init; init.direction = webrtc::RtpTransceiverDirection::kSendOnly; init.stream_ids = {stream_id};
+      auto result = pc_->AddTransceiver(local, init);
+      if (!result.ok()) { fail(std::string(result.error().message())); return; }
+      auto transceiver = result.MoveValue();
+      // M137 associates new remote recvonly sections only with transceivers
+      // created by AddTrack (JSEP 5.10). We chose this transceiver explicitly
+      // to avoid reusing a remote sendonly section, then restore that native
+      // association eligibility. Keep this pinned adapter alongside the SFU's
+      // existing native transceiver access; no SDP MID is assigned by hand.
+      runtime_.signaling_->BlockingCall([&] {
+        auto* proxy = static_cast<webrtc::RtpTransceiverProxyWithInternal<webrtc::RtpTransceiver>*>(transceiver.get());
+        proxy->internal()->set_created_by_addtrack(true);
+      });
+      senders_[sid] = transceiver->sender();
+    }
+  } else {
+    auto result = pc_->AddTrack(local, {stream_id});
+    if (!result.ok()) { fail(std::string(result.error().message())); return; }
+    senders_[sid] = result.MoveValue();
+  }
+  if (sfu_ && codec) sender_codecs_[senders_[sid]->id()]=*codec;
   if (sfu_) sfu_->add(sid, senders_[sid]->id(), remote);
-  negotiate();
+  dirty_ = true; negotiate();
 }
 void Peer::remove_track(const std::string& sid) {
   auto it = senders_.find(sid); if (closed_ || it == senders_.end()) return;
   if (sfu_) sfu_->remove(sid);
   auto result = pc_->RemoveTrackOrError(it->second);
+  requested_senders_.erase(it->second->id());
+  sender_codecs_.erase(it->second->id());
   senders_.erase(it);
   if (!result.ok()) { fail(std::string(result.message())); return; }
-  negotiate();
+  dirty_ = true; negotiate();
 }
 void Peer::enable_track(const std::string& sid, bool enabled) {
   if (sfu_) { sfu_->enable(sid, enabled); return; }
@@ -326,8 +434,28 @@ void Peer::OnConnectionChange(webrtc::PeerConnectionInterface::PeerConnectionSta
   });
 }
 void Peer::OnTrack(webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> t) {
-  auto track = t->receiver()->track(); std::string mid = t->mid().value_or("");
-  boost::asio::post(io_, [weak = weak_from_this(), track, mid] { if (auto p = weak.lock(); p && !p->closed_ && p->events_.track) p->events_.track(track, mid); });
+  // OnTrack precedes answer application; GetParameters can still be empty.
+  // Publish metadata/subscriptions only after the negotiated channel exists.
+  boost::asio::post(io_, [weak = weak_from_this(), t] {
+    if (auto p=weak.lock();p && !p->closed_) p->pending_tracks_.push_back(t);
+  });
+}
+void Peer::publication_codec(const std::string& cid,const std::string& codec) {
+  if (codec.empty()) publication_codecs_.erase(cid);
+  else publication_codecs_[cid]=codec_name(codec);
+}
+void Peer::deliver_tracks() {
+  auto tracks=std::exchange(pending_tracks_,{});
+  for (const auto& t:tracks) {
+    if (closed_) break;
+    auto mid=t->mid().value_or("");
+    auto parameters=t->receiver()->GetParameters();
+    if (pc_->local_description()) {
+      const auto* content=pc_->local_description()->description()->GetContentByName(mid);
+      if (content && content->media_description()) negotiated_codecs(parameters,*content->media_description());
+    }
+    if (events_.track) events_.track(t->receiver()->track(),mid,parameters);
+  }
 }
 void Peer::OnRemoveTrack(webrtc::scoped_refptr<webrtc::RtpReceiverInterface> r) {
   auto id = r->track()->id();

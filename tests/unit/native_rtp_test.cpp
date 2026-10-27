@@ -1,4 +1,5 @@
 #include "lk/native_rtp.hpp"
+#include "lk/media_codec.hpp"
 #include <api/environment/environment_factory.h>
 #include <modules/rtp_rtcp/include/rtp_header_extension_map.h>
 #include <modules/rtp_rtcp/source/rtp_header_extensions.h>
@@ -162,6 +163,78 @@ void run_frames() {
   check(!tight_sender.forward_frame(encoded(1,90000,true,1900),11) && tight->stats().queue_bytes==0,
     "Frame admission ignored native transport overhead at queue boundary");
 }
+void run_audio_codecs() {
+  webrtc::SimulatedClock clock(1000000); auto env=webrtc::CreateEnvironment(&clock);
+  for (auto [name,pt]:{std::pair{"PCMU",0},std::pair{"PCMA",8},std::pair{"opus",111}}) {
+    const int rate=pt==111 ? 48000 : 8000;
+    webrtc::RtpCodecParameters codec;codec.name=name;codec.payload_type=pt;
+    codec.clock_rate=rate;codec.num_channels=pt==111 ? 2 : 1;
+    webrtc::RtpParameters params;params.codecs.push_back(codec);
+    check(lk::primary_media_codec(params,true).has_value(),"Supported audio codec was excluded");
+    check(!lk::primary_media_codec(params,false),"Audio codec was classified as video");
+    if (pt!=111) {
+      auto invalid=codec;invalid.clock_rate=48000;
+      check(!lk::forwarding_codec(invalid),"G711 accepted a nonstandard RTP clock");
+      invalid=codec;invalid.num_channels=2;
+      check(!lk::forwarding_codec(invalid),"G711 accepted unsupported stereo RTP");
+    }
+    lk::NativeSendConfig send;send.audio=true;send.ssrc=22;send.payload_type=pt;
+    std::vector<webrtc::RtpPacketToSend> packets;
+    lk::NativeRtpSender sender(env,send,[&](const auto& p){packets.push_back(p);return true;},[]{});
+    lk::NativeReceiveConfig receive;receive.audio=true;receive.ssrc=11;receive.payload_type=pt;receive.clock_rate_hz=rate;
+    lk::NativeRtpReceiver receiver(env,receive,[&](const auto& p){
+      check(p.payload_type_frequency()==rate,"Native receive statistics used the wrong audio clock");sender.forward(p);
+    },[](Bytes){return true;});
+    for (int i=0;i<3;++i) {
+      auto input=packet(uint16_t(65534+i));input.SetPayloadType(pt);input.SetTimestamp(uint32_t(0xfffffff0u+i*(rate/50)));
+      receiver.receive(input);
+      const auto& output=packets.back();
+      check(output.packet_type()==webrtc::RtpPacketMediaType::kAudio && output.Ssrc()==22 && output.PayloadType()==pt,"Audio packet metadata mapping failed");
+      check(output.Timestamp()==input.Timestamp(),"Forwarding altered the codec's RTP clock, including wrap");
+      check(output.payload_size()==input.payload_size() && std::equal(input.payload().begin(),input.payload().end(),output.payload().begin()),"Forwarding changed encoded audio bytes");
+    }
+    check(packets.size()==3,"Audio forwarding lost a packet");
+  }
+}
+void run_h264_frames() {
+  webrtc::SimulatedClock clock(1000000); auto env=webrtc::CreateEnvironment(&clock);
+  lk::NativeSendConfig config; config.ssrc=111; config.rtx_ssrc=112;
+  config.payload_type=100; config.rtx_payload_type=101; config.video_codec=webrtc::kVideoCodecH264;
+  std::vector<webrtc::RtpPacketToSend> upstream,downstream;
+  lk::NativeRtpSender publisher(env,config,[&](const auto& p){upstream.push_back(p);return true;},[]{});
+  auto out=config; out.ssrc=211;out.rtx_ssrc=212;out.payload_type=102;out.rtx_payload_type=103;
+  lk::NativeRtpSender subscriber(env,out,[&](const auto& p){downstream.push_back(p);return true;},[]{});
+  // Annex-B IDR payload: exercise native fragmentation and reassembly without
+  // pretending these synthetic slice bytes are decodable camera media.
+  // Real SPS/PPS syntax (320x240), followed by synthetic slice content. The
+  // parameter sets and IDR must survive STAP-A/FU-A byte for byte.
+  std::vector<uint8_t> payload{0,0,0,1,0x67,0x7a,0x00,0x0d,0xbc,0xd9,0x41,0x41,0xfa,0x10,0,0,
+    3,0,0x10,0,0,3,3,0xc0,0xf1,0x42,0x99,0x60,0,0,0,1,0x68,0xeb,0xe3,0xcb,0x22,0xc0,
+    0,0,0,1,0x65,0xff};
+  payload.resize(payload.size()+4200,0x55);
+  auto frame=encoded(1,90000);frame.SetEncodedData(webrtc::EncodedImageBuffer::Create(payload.data(),payload.size()));
+  check(publisher.forward_frame(frame,11),"H264 keyframe was rejected");
+  check(upstream.size()>3,"H264 large IDR was not fragmented into native FU-A packets");
+  int assembled=0,decoded_payloads=0;
+  lk::NativeVideoAssembler input([&](const auto& f){
+    ++assembled;check(f.is_keyframe(),"Native H264 IDR classification was lost");
+    check(f.size()==payload.size() && std::equal(payload.begin(),payload.end(),f.data()),"H264 upstream assembly changed Annex-B bytes");
+    check(subscriber.forward_frame(f,111),"H264 subscriber refused complete recovered frame");
+  },webrtc::kVideoCodecH264);
+  lk::NativeReceiveConfig receive;receive.ssrc=111;receive.payload_type=100;receive.rtx_payload_type=101;receive.video_codec=webrtc::kVideoCodecH264;
+  lk::NativeRtpReceiver receiver(env,receive,[&](const auto& p){input.receive(p);},[](Bytes){return true;});
+  for(size_t i=0;i<upstream.size();++i)if(i!=1)receiver.receive(received(upstream[i]));
+  check(assembled==0 && downstream.empty(),"Incomplete H264 frame was forwarded before loss recovery");
+  webrtc::rtcp::Nack nack;nack.SetSenderSsrc(999);nack.SetMediaSsrc(111);nack.SetPacketIds({upstream[1].SequenceNumber()});
+  clock.AdvanceTimeMilliseconds(200);publisher.feedback(bytes(nack.Build()));
+  check(upstream.back().Ssrc()==112,"H264 NACK did not produce RTX");receiver.receive(received(upstream.back()));
+  check(assembled==1 && !downstream.empty(),"Recovered H264 frame did not traverse SFU");
+  lk::NativeVideoAssembler output([&](const auto& f){
+    ++decoded_payloads;check(f.size()==payload.size() && std::equal(payload.begin(),payload.end(),f.data()),"H264 downstream repacketization changed encoded content");
+  },webrtc::kVideoCodecH264);
+  for(const auto& p:downstream){check(p.PayloadType()==102 && p.Ssrc()==211,"H264 downstream payload/SSRC mapping failed");output.receive(received(p));}
+  check(decoded_payloads==1,"H264 downstream assembler did not emit one complete frame");
+}
 template<class F> void blocks(const webrtc::Buffer& buffer,F callback) {
   auto* cursor=buffer.data(); const auto* end=cursor+buffer.size();
   while (cursor<end) {
@@ -293,8 +366,8 @@ int main() {
   auto thread=webrtc::Thread::Create(); thread->SetName("native-rtp-test",nullptr);
   if (!thread->Start()) return 1;
   std::string error;
-  thread->BlockingCall([&] { try {run();run_frames();} catch (const std::exception& e) {error=e.what();} });
+  thread->BlockingCall([&] { try {run();run_frames();run_h264_frames();run_audio_codecs();} catch (const std::exception& e) {error=e.what();} });
   thread->Stop();
   if (!error.empty()) { std::cerr << error << '\n'; return 1; }
-  std::cout << "PASS native RTP/RTCP, loss recovery, encoded VP8 assembly/repacketization and frame switching\n";
+  std::cout << "PASS native RTP/RTCP, loss recovery, encoded VP8/H264 assembly/repacketization, frame switching and PCMU/PCMA/Opus clocks/payload preservation\n";
 }

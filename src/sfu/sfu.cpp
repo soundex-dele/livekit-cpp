@@ -1,4 +1,5 @@
 #include "lk/sfu.hpp"
+#include "lk/media_codec.hpp"
 #include "lk/native_rtp.hpp"
 #include "lk/video_allocation.hpp"
 #include <api/environment/environment_factory.h>
@@ -215,7 +216,7 @@ struct Source : webrtc::RtpPacketSinkInterface {
     if (!spec.ssrc || layers.contains(spec.ssrc)) return;
     auto layer=std::make_unique<Layer>(); layer->spec=spec;
     auto receive_config=config; receive_config.ssrc=spec.ssrc;
-    if (!config.audio) layer->assembler=std::make_unique<NativeVideoAssembler>([this,id=spec.ssrc](const auto& frame){route_frame(id,frame);});
+    if (!config.audio) layer->assembler=std::make_unique<NativeVideoAssembler>([this,id=spec.ssrc](const auto& frame){route_frame(id,frame);},config.video_codec);
     layer->receiver=std::make_unique<NativeRtpReceiver>(env,receive_config,
       [this,id=spec.ssrc](const auto& packet){route(id,packet);},[this](Bytes packet) {
         bool sent=send_packet(transport,packet,true);
@@ -406,6 +407,7 @@ void Source::route_frame(uint32_t id,const webrtc::EncodedFrame& frame) {
   }
 }
 struct Snapshot {
+  bool sending = false;
   webrtc::BaseChannel* channel=nullptr;
   std::string mid,sender_id;
   TrackRef track;
@@ -413,9 +415,11 @@ struct Snapshot {
   std::vector<webrtc::StreamParams> streams;
 };
 int primary_codec(const webrtc::RtpParameters& p,bool audio) {
-  for (const auto& codec:p.codecs)
-    if (lower(codec.name)==(audio ? "opus" : "vp8")) return codec.payload_type;
-  return -1;
+  const auto codec=primary_media_codec(p,audio); return codec ? codec->payload_type : -1;
+}
+webrtc::VideoCodecType video_codec_type(const webrtc::RtpParameters& p,int payload_type) {
+  for (const auto& codec:p.codecs) if (codec.payload_type==payload_type && codec_name(codec.name)=="h264") return webrtc::kVideoCodecH264;
+  return webrtc::kVideoCodecVP8;
 }
 int rtx_codec(const webrtc::RtpParameters& p,int primary) {
   for (const auto& codec:p.codecs) if (lower(codec.name)=="rtx") {
@@ -448,7 +452,7 @@ struct SfuRouter::Impl {
 };
 struct SfuSession::State : std::enable_shared_from_this<State> {
   std::shared_ptr<SfuRouter::Impl> router;
-  bool subscriber;
+  bool subscriber, bidirectional;
   std::map<std::string,std::shared_ptr<Output>> outputs;
   std::vector<std::shared_ptr<Source>> inputs;
   // Transport ownership of a weak observer token prevents callback accumulation
@@ -466,10 +470,10 @@ struct SfuSession::State : std::enable_shared_from_this<State> {
     for (auto& [_,sender]:send_transports) sender->unbind();
   }
   void rtcp(Transport* transport,Bytes bytes) {
-    if (subscriber) {
+    if (subscriber || bidirectional) {
       if (auto it=send_transports.find(transport);it!=send_transports.end()) it->second->native->feedback(bytes);
       for (auto& [_,out]:outputs) if (out->transport==transport && out->sender) out->sender->feedback(bytes);
-      return;
+      if (!bidirectional) return;
     }
     for (auto& input:inputs) if (input->transport==transport)
       for (auto& [_,layer]:input->layers) layer->receiver->feedback(bytes);
@@ -500,8 +504,8 @@ struct SfuSession::State : std::enable_shared_from_this<State> {
       s.channel->media_send_channel()->SetInterface(nullptr);
       s.channel->media_receive_channel()->SetInterface(nullptr);
       uint32_t ssrc=s.parameters.encodings.empty() ? 0 : s.parameters.encodings.front().ssrc.value_or(0);
-      if (subscriber && !ssrc) continue;
-      if (subscriber) {
+      if (s.sending && !ssrc) continue;
+      if (s.sending) {
         auto& sender=send_transports[transport];
         if (!sender || observers[transport].expired()) {
           sender=std::make_shared<SendTransport>(router->env,router->counters,router->pacer_timer.get());
@@ -513,6 +517,7 @@ struct SfuSession::State : std::enable_shared_from_this<State> {
           config.audio=out->source->track->kind()=="audio";
           config.payload_type=primary_codec(s.parameters,config.audio);
           if (config.payload_type<0) continue;
+          config.video_codec=video_codec_type(s.parameters,config.payload_type);
           config.ssrc=ssrc; config.mid=s.mid; config.extensions=s.parameters.header_extensions;
           config.rtx_payload_type=rtx_codec(s.parameters,config.payload_type);
           for (const auto& stream:s.streams) {
@@ -528,8 +533,11 @@ struct SfuSession::State : std::enable_shared_from_this<State> {
         input->congestion=receiver;
         NativeReceiveConfig config;
         config.audio=s.track->kind()=="audio";
-        config.payload_type=primary_codec(s.parameters,config.audio);
-        if (config.payload_type<0) continue;
+        const auto codec=primary_media_codec(s.parameters,config.audio);
+        if (!codec || !codec->clock_rate) continue;
+        config.payload_type=codec->payload_type;
+        config.clock_rate_hz=*codec->clock_rate;
+        config.video_codec=video_codec_type(s.parameters,config.payload_type);
         config.rtx_payload_type=rtx_codec(s.parameters,config.payload_type);
         config.extensions=s.parameters.header_extensions;
         std::vector<LayerSpec> specs;
@@ -568,7 +576,7 @@ struct SfuSession::State : std::enable_shared_from_this<State> {
         });
       }
     }
-    if (!subscriber) inputs=std::move(active_inputs);
+    inputs=std::move(active_inputs);
     for (auto it=receive_transports.begin();it!=receive_transports.end();) {
       if (!observed.contains(it->first)) it=receive_transports.erase(it); else ++it;
     }
@@ -620,8 +628,8 @@ Json SfuRouter::metrics() const {
       {"sfu_pacer_admission_drops",paced.queue_dropped}};
   });
 }
-SfuSession::SfuSession(SfuRouter& router,bool subscriber) : state_(std::make_shared<State>()) {
-  state_->router=router.impl_; state_->subscriber=subscriber;
+SfuSession::SfuSession(SfuRouter& router,bool subscriber,bool bidirectional) : state_(std::make_shared<State>()) {
+  state_->router=router.impl_; state_->subscriber=subscriber; state_->bidirectional=bidirectional;
 }
 SfuSession::~SfuSession() {
   detach(); state_->router->network->BlockingCall([&] {
@@ -659,7 +667,7 @@ void SfuSession::settings(const std::string& sid,const VideoSubscription& settin
 }
 void SfuSession::detach() { state_->router->network->BlockingCall([&] { state_->detach(); }); }
 void SfuSession::prepare_answer(webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc,webrtc::SessionDescriptionInterface& answer) {
-  if (state_->subscriber) return;
+  if (state_->subscriber && !state_->bidirectional) return;
   state_->router->signaling->BlockingCall([&] {
     if (!pc->remote_description()) return;
     for (const auto& offered:pc->remote_description()->description()->contents()) {
@@ -690,16 +698,27 @@ void SfuSession::prepare_answer(webrtc::scoped_refptr<webrtc::PeerConnectionInte
 }
 void SfuSession::refresh(webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc) {
   std::vector<Snapshot> snapshots;
-  for (auto& transceiver:pc->GetTransceivers()) {
-    Snapshot s; s.mid=transceiver->mid().value_or("");
+  for (auto& transceiver:pc->GetTransceivers()) for (bool sending : {false, true}) {
+    if (!state_->bidirectional && sending != state_->subscriber) continue;
+    const auto direction = transceiver->current_direction();
+    if (state_->bidirectional && (!direction || *direction == webrtc::RtpTransceiverDirection::kInactive ||
+        (sending && *direction == webrtc::RtpTransceiverDirection::kRecvOnly) ||
+        (!sending && *direction == webrtc::RtpTransceiverDirection::kSendOnly))) continue;
+    Snapshot s; s.sending=sending; s.mid=transceiver->mid().value_or("");
     if (s.mid.empty() || transceiver->stopped()) continue;
     s.sender_id=transceiver->sender()->id(); s.track=transceiver->receiver()->track();
-    s.parameters=state_->subscriber ? transceiver->sender()->GetParameters() : transceiver->receiver()->GetParameters();
+    s.parameters=sending ? transceiver->sender()->GetParameters() : transceiver->receiver()->GetParameters();
     s.channel=state_->router->signaling->BlockingCall([&] {
+      const auto* accepted=pc->local_description();
+      if (accepted && accepted->GetType()==webrtc::SdpType::kOffer) accepted=pc->remote_description();
+      if (accepted) {
+        const auto* content=accepted->description()->GetContentByName(s.mid);
+        if (content && content->media_description()) negotiated_codecs(s.parameters,*content->media_description());
+      }
       // RID-only receivers have no native receive stream yet, and M137's
       // default receiver parameters omit the negotiated extension map. Read
       // the accepted native JSEP content, not a handwritten SDP parser.
-      if (!state_->subscriber && pc->local_description()) {
+      if (!sending && pc->local_description()) {
         const auto* content=pc->local_description()->description()->GetContentByName(s.mid);
         if (content && content->media_description())
           s.parameters.header_extensions=content->media_description()->rtp_header_extensions();
@@ -714,7 +733,7 @@ void SfuSession::refresh(webrtc::scoped_refptr<webrtc::PeerConnectionInterface> 
     if (s.channel) {
       // StreamParams are worker-thread owned; snapshot their FID associations.
       state_->router->worker->BlockingCall([&] {
-        s.streams=state_->subscriber ? s.channel->local_streams() : s.channel->remote_streams();
+        s.streams=sending ? s.channel->local_streams() : s.channel->remote_streams();
       });
       snapshots.push_back(std::move(s));
     }

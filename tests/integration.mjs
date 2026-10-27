@@ -5,14 +5,21 @@ import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { once } from 'node:events';
-import { createHmac } from 'node:crypto';
+import { createHmac, createHash } from 'node:crypto';
 import { AccessToken, RoomServiceClient } from 'livekit-server-sdk';
 import { chromium } from 'playwright';
 import { ListRoomsRequest, ListRoomsResponse } from '@livekit/protocol';
+import { captureRtcDiagnostics } from './rtc_diagnostics.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const results = process.env.LK_TEST_RESULTS ? resolve(process.env.LK_TEST_RESULTS) : resolve(here, 'results');
 mkdirSync(results, {recursive: true});
+const testSources={};
+for (const name of ['integration.mjs','rtc_diagnostics.mjs']) {
+  const bytes=readFileSync(resolve(here,name));
+  writeFileSync(resolve(results,name),bytes);
+  testSources[name]=createHash('sha256').update(bytes).digest('hex');
+}
 const port = Number(process.env.LK_TEST_PORT || 17880);
 const externalServer = process.env.LK_EXTERNAL_SERVER === '1';
 const forceRelay = process.env.LK_FORCE_RELAY === '1';
@@ -26,6 +33,7 @@ const turnCredentialAudit = [];
 const base = externalServer ? (process.env.LK_TEST_URL || `http://127.0.0.1:${port}`) : `http://127.0.0.1:${port}`;
 const exe = process.env.LK_SERVER || resolve(here, process.platform === 'win32'
   ? '../out/windows-x64/Release/livekit-server.exe' : '../out/linux-x64/bin/livekit-server');
+const serverSha256=externalServer ? undefined : createHash('sha256').update(readFileSync(exe)).digest('hex');
 const child = externalServer ? null : spawn(exe, ['--dev', '--port', String(port)], {windowsHide: true});
 let serverLog = ''; child?.stdout.on('data', b => { serverLog += b; }); child?.stderr.on('data', b => { serverLog += b; });
 let spawnError; child?.on('error', e => { spawnError = e; });
@@ -186,7 +194,8 @@ try {
   const video = info.tracks.find(t => t.type === 1); assert.ok(video);
   await api.mutePublishedTrack('integration', 'alice', video.sid, true);
   await eventually(() => bob.evaluate(sid => room.remoteParticipants.get('alice')?.getTrackPublicationBySid(sid)?.isMuted, video.sid), 'mute');
-  await api.mutePublishedTrack('integration', 'alice', video.sid, false);
+  await assert.rejects(api.mutePublishedTrack('integration', 'alice', video.sid, false), /remote unmute not enabled/);
+  await alice.evaluate(sid => room.localParticipant.trackPublications.get(sid).track.unmute(), video.sid);
   await eventually(() => bob.evaluate(sid => !room.remoteParticipants.get('alice')?.getTrackPublicationBySid(sid)?.isMuted, video.sid), 'unmute');
   await api.updateSubscriptions('integration', 'bob', [video.sid], false);
   await eventually(() => bob.evaluate(sid => !tracks.has(sid), video.sid), 'unsubscribe');
@@ -233,7 +242,13 @@ try {
     const found=rows.find(s => s.width===width && s.height===height && s.frames>after+3);
     if (found) output.push(`Layer decoded: ${width}x${height} after ${Date.now()-started} ms, frames=${found.frames}`);
     return found || false;
-  },`simulcast decoded ${width}x${height}`,30000); };
+  },`simulcast decoded ${width}x${height}`,30000).catch(async error => {
+    const diagnostics=await Promise.all([alice,page].map(async client=>{
+      try {return await client.evaluate(captureRtcDiagnostics);} catch (e) {return {error:String(e)};}
+    }));
+    writeFileSync(resolve(results,'simulcast-timeout.json'),JSON.stringify({width,height,after,elapsedMs:Date.now()-started,diagnostics},null,2));
+    throw error;
+  }); };
   const audioBefore=(await mediaStats(bob)).find(s => s.kind==='audio').samples;
   await quality(bob,'LOW'); await quality(late,'HIGH');
   const low=await resolution(bob,320,180); await resolution(late,1280,720);
@@ -269,6 +284,8 @@ try {
     params.encodings.find(e => e.rid==='f').active=true; await sender.setParameters(params);
   });
   await resolution(bob,1280,720); await resolution(late,1280,720);
+  writeFileSync(resolve(results,'rtc-checkpoint.json'),JSON.stringify(await Promise.all(
+    [alice,bob,late].map(page=>page.evaluate(captureRtcDiagnostics))),null,2));
   const layerMetrics=await auditSfu(); assert.ok(layerMetrics.sfu_layer_switches>=2);
   assert.ok(layerMetrics.sfu_audio_reserved_bps>=64000 && layerMetrics.sfu_video_allocated_bps>0,
     'Real audio/video subscriptions must participate in bandwidth allocation');
@@ -405,7 +422,10 @@ try {
     const diagnosticToken = new AccessToken('devkey', 'secret'); diagnosticToken.addGrant({roomList:true});
     const metrics = await (await fetch(`${base}/metrics`, {headers:{Authorization:`Bearer ${await diagnosticToken.toJwt()}`}})).text();
     output.push(metrics); console.error(metrics);
+    const connections=[];
     for (const context of browser?.contexts() || []) for (const page of context.pages()) {
+      try {connections.push(await page.evaluate(captureRtcDiagnostics));}
+      catch (error) {connections.push({error:String(error)});}
       const diagnostics = await page.evaluate(async () => {
         const result = [];
         for (const track of window.tracks?.values() || []) {
@@ -422,6 +442,7 @@ try {
       });
       output.push(JSON.stringify(diagnostics)); console.error(JSON.stringify(diagnostics));
     }
+    writeFileSync(resolve(results,'rtc-diagnostics.json'),JSON.stringify(connections,null,2));
   } catch (diagnosticError) { output.push(`Diagnostics unavailable: ${diagnosticError.message}`); }
 } finally {
   try {
@@ -445,7 +466,7 @@ try {
   writeFileSync(resolve(results, 'server.log'), serverLog);
   writeFileSync(resolve(results, 'integration.log'), output.join('\n') + '\n');
   if (expectTurnRest) writeFileSync(resolve(results,'turn-credentials.json'),JSON.stringify(turnCredentialAudit,null,2));
-  writeFileSync(resolve(results, 'result.json'), JSON.stringify({ok:process.exitCode !== 1, checks,
+  writeFileSync(resolve(results, 'result.json'), JSON.stringify({ok:process.exitCode !== 1, checks, testSources, serverSha256,
     server:base, externalServer, serverExitCode:child?.exitCode, serverSignal:child?.signalCode,
     forceRelay, turnTransport, expectTurnRest, resubscribeRounds, platform:process.platform, arch:process.arch,
     nodeVersion:process.version, browserVersion}, null, 2));

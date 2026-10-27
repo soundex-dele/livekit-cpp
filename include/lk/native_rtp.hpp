@@ -68,6 +68,7 @@ struct NativeSendConfig {
   std::optional<uint32_t> rtx_ssrc;
   int payload_type=96,rtx_payload_type=-1;
   bool audio=false,extmap_allow_mixed=false;
+  webrtc::VideoCodecType video_codec=webrtc::kVideoCodecVP8;
   std::string mid;
   std::vector<webrtc::RtpExtension> extensions;
   bool operator==(const NativeSendConfig&) const = default;
@@ -79,7 +80,7 @@ class NativeRtpSender {
                  std::shared_ptr<NativeSendTransport> transport = {});
   ~NativeRtpSender();
   void forward(const webrtc::RtpPacketReceived&);
-  // Repacketize an already encoded VP8 frame with the native packetizer.
+  // Repacketize an already encoded frame with its native codec packetizer.
   // Each subscriber owns picture IDs, RTP sequence and source clock mapping.
   bool forward_frame(const webrtc::EncodedFrame&,uint32_t source_ssrc);
   void feedback(webrtc::ArrayView<const uint8_t>);
@@ -91,12 +92,12 @@ class NativeRtpSender {
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
-// Native VP8 depacketization, complete-frame assembly and dependency discovery.
+// Native depacketization, complete-frame assembly and dependency discovery.
 // Does not create a decoder. Include RTP padding so native gap tracking works.
 class NativeVideoAssembler {
  public:
   using Frame = std::function<void(const webrtc::EncodedFrame&)>;
-  explicit NativeVideoAssembler(Frame);
+  explicit NativeVideoAssembler(Frame,webrtc::VideoCodecType codec=webrtc::kVideoCodecVP8);
   ~NativeVideoAssembler();
   void receive(const webrtc::RtpPacketReceived&);
  private:
@@ -106,7 +107,9 @@ class NativeVideoAssembler {
 struct NativeReceiveConfig {
   uint32_t ssrc=0;
   int payload_type=96,rtx_payload_type=-1;
+  int clock_rate_hz=90000;
   bool audio=false;
+  webrtc::VideoCodecType video_codec=webrtc::kVideoCodecVP8;
   std::vector<webrtc::RtpExtension> extensions;
   bool operator==(const NativeReceiveConfig&) const = default;
 };

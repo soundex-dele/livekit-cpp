@@ -1,5 +1,9 @@
 # RTC 系统功能现状与暂停交接
 
+> 本文保留 2026-10-26 的历史交接快照。2026-10-27 已按用户要求恢复主服务
+> 替代工作，当前实现与验收状态见 [Go 主服务替代](GO_REPLACEMENT.md) 和
+> [视频稳定性排查](GO_VIDEO_STABILITY.md)；下文的“未支持”是当时状态。
+
 更新日期：2026-10-26（Asia/Shanghai）。范围：`D:\workspace\livekit-cpp` 服务端、
 `D:\workspace\livekit-sdk-cpp` SDK，以及 `D:\workspace\webrtc` 原生依赖。
 

@@ -94,13 +94,31 @@ int main() {
     lk::Json payload = {{"iss", "key"}, {"sub", "alice"}, {"exp", 2000}, {"nbf", 1000}, {"video", {{"roomJoin", true}, {"room", "demo"}, {"canPublish", false}}}};
     auto token = lk::Auth::sign(payload, "secret"); auto claims = auth.verify(token, 1500);
     check(claims.join && !claims.publish && claims.subscribe && claims.room == "demo", "Grants differ from token");
-    rejected([&] { auth.verify(token, 2000); }, 401);
-    rejected([&] { auth.verify(token, 999); }, 401);
+    check(auth.verify(token, 2059).join && auth.verify(token, 940).join, "JWT one minute leeway missing");
+    rejected([&] { auth.verify(token, 2060); }, 401);
+    rejected([&] { auth.verify(token, 939); }, 401);
+    auto missing_exp = payload; missing_exp.erase("exp");
+    rejected([&] { auth.verify(lk::Auth::sign(missing_exp, "secret"), 1500); }, 401);
+    check(!claims.publish_data, "Unspecified data permission did not inherit canPublish");
+    const auto refreshed = auth.verify(auth.refresh(claims, 1800), 1800);
+    check(refreshed.expires_at == 2400 && !refreshed.publish_data && refreshed.identity == claims.identity,
+          "Refresh lost identity, permissions, or ten minute minimum lifetime");
+    auto long_lived = claims; long_lived.expires_at = 9000;
+    check(auth.verify(auth.refresh(long_lived, 1800), 1800).expires_at == 9000, "Refresh shortened original lifetime");
     rejected([&] { auth.verify(lk::Auth::sign(payload, "wrong"), 1500); }, 401);
     rejected([&] { auth.verify("eyJhbGciOiJub25lIn0.e30.", 1500); }, 401);
     rejected([&] { auth.verify(token + ".extra", 1500); }, 401);
     payload["video"]["canPublishData"] = false;
     check(!auth.verify(lk::Auth::sign(payload, "secret"), 1500).publish_data, "Data permission ignored");
+    payload["video"]["destinationRoom"] = "target";
+    check(auth.verify(lk::Auth::sign(payload, "secret"), 1500).destination_room == "target", "Destination room grant ignored");
+    payload["video"]["recorder"] = true;
+    check(auth.verify(lk::Auth::sign(payload, "secret"), 1500).is_recorder(), "Recorder grant ignored");
+    payload["video"]["recorder"] = false; payload["kind"] = "EGRESS";
+    check(auth.verify(lk::Auth::sign(payload, "secret"), 1500).is_recorder(), "Case-insensitive egress kind ignored");
+    payload["kind"] = "AgEnT"; payload["video"]["hidden"] = true;
+    auto hidden_agent = auth.verify(lk::Auth::sign(payload, "secret"), 1500);
+    check(hidden_agent.hidden && hidden_agent.is_dependent() && !hidden_agent.is_recorder(), "Hidden agent grants differ from token");
     livekit::SignalRequest request; request.mutable_ping_req()->set_timestamp(123456);
     livekit::SignalRequest decoded; check(decoded.ParseFromString(request.SerializeAsString()) && decoded.ping_req().timestamp() == 123456, "Protobuf roundtrip failed");
 #if defined(_WIN32)
@@ -113,7 +131,24 @@ int main() {
     auto room = rooms.api("CreateRoom", {{"name", "demo"}, {"maxParticipants", 1}}, admin);
     check(room["sid"].get<std::string>().starts_with("RM_"), "Room SID missing");
     check(rooms.api("CreateRoom", {{"name", "demo"}}, admin)["sid"] == room["sid"], "CreateRoom not idempotent");
-    rejected([&] { rooms.api("ListRooms", lk::Json::object(), claims); }, 403);
+    rejected([&] { rooms.api("ListRooms", lk::Json::object(), claims); }, 401);
+    const std::string large_metadata(512 * 1024, 'm');
+    check(rooms.api("UpdateRoomMetadata", {{"room", "demo"}, {"metadata", large_metadata}}, admin)["metadata"] == large_metadata,
+          "Go default metadata limit rejected a valid 512 KiB value");
+    rejected([&] { rooms.api("UpdateRoomMetadata", {{"room", "demo"}, {"metadata", large_metadata + "x"}}, admin); }, 400);
+    check(rooms.api("ListRooms", {{"names", {"demo"}}}, admin)["rooms"][0]["metadata"] == large_metadata,
+          "Rejected metadata update changed room state");
+    rooms.api("UpdateRoomMetadata", {{"room", "demo"}, {"metadata", ""}}, admin);
+    rooms.api("SendData", {{"room", "demo"}, {"data", "dGVzdA=="}, {"nonce", "AAAAAAAAAAAAAAAAAAAAAA=="}}, admin);
+    rejected([&] { rooms.api("SendData", {{"room", "demo"}, {"nonce", "YmFk"}}, admin); }, 400);
+    lk::Claims absent_admin = admin; absent_admin.room = "absent";
+    auto absent = rooms.api("ListParticipants", {{"room", "absent"}}, absent_admin);
+    check(!absent.contains("participants") || absent["participants"].empty(), "Missing room did not return an empty participant list");
+    check(rooms.metrics()["rooms"] == 1, "Listing a missing room created it");
+    auto empty_name_room = rooms.api("CreateRoom", lk::Json::object(), admin);
+    check(empty_name_room["sid"].get<std::string>().starts_with("RM_"), "Go-compatible empty room name rejected by management API");
+    rooms.api("DeleteRoom", {{"room", ""}}, admin);
+    check(rooms.metrics()["rooms"] == 1, "Empty-name room was not removed");
     auto sink = std::make_shared<Sink>(); auto p = rooms.join(claims, true, sink);
     check(sink->messages.front().has_join() && sink->messages.front().join().subscriber_primary(), "Join response invalid");
     const auto join_ice=sink->messages.front().join().ice_servers();
@@ -126,13 +161,54 @@ int main() {
     const auto deadline = lk::now_ms() + 5000;
     while (!has_offer() && !p->closed && lk::now_ms() < deadline) io.run_for(std::chrono::milliseconds(100));
     check(has_offer(), "Native subscriber did not produce a data-channel SDP offer");
+    p->ice_connected = true; // Transport establishment is exercised by the headless differential suite.
+    rooms.signal_closed(p, sink.get());
+    check(!p->closed && p->sink.expired(), "Signal close destroyed established participant");
+    auto resumed_sink = std::make_shared<Sink>();
+    const auto original_sid = p->info.sid();
+    auto stale_claims = claims; stale_claims.publish = true;
+    check(rooms.resume(stale_claims, resumed_sink) == p && p->info.sid() == original_sid && !p->claims.publish,
+          "Resume replaced participant or restored stale token grants");
+    check(resumed_sink->messages.front().has_reconnect(), "Resume did not send reconnect response first");
+    rooms.signal_closed(p, sink.get());
+    check(!p->closed && p->sink.lock() == resumed_sink, "Old signal close detached resumed session");
+    sink = resumed_sink;
+    request.Clear(); request.mutable_sync_state(); rooms.signal(p, request);
+    check(!p->closed, "Valid empty SyncState forced full reconnect");
+    auto missing_claims = claims; missing_claims.identity = "missing-resume";
+    check(!rooms.resume(missing_claims, std::make_shared<Sink>()), "Resume created an unknown participant");
+    auto handover_sink = std::make_shared<Sink>();
+    check(rooms.resume(claims, handover_sink) == p && sink->closed, "Live signal handover did not retire old sink");
+    rooms.signal_closed(p, sink.get());
+    check(p->sink.lock() == handover_sink && !p->closed, "Retired live socket closed new session");
+    sink = handover_sink;
+    lk::Participant cache_probe;
+    livekit::SignalResponse cache_update;
+    auto* cached_info = cache_update.mutable_update()->add_participants();
+    cached_info->set_metadata(std::string(8192, 'x')); cached_info->set_state(livekit::ParticipantInfo::DISCONNECTED);
+    for (int i = 0; i < 200; ++i) {
+      cached_info->set_sid("PA_cache_" + std::to_string(i)); cache_probe.send(cache_update);
+    }
+    check(cache_probe.update_cache.size() == 128 && !cache_probe.update_cache.contains("PA_cache_0") &&
+          cache_probe.update_cache.at("PA_cache_199").info.metadata().empty(), "Resume cache unbounded or retained peer metadata");
     lk::Claims bob = claims; bob.identity = "bob";
     rejected([&] { rooms.join(bob, true, std::make_shared<Sink>()); }, 429);
     request.Clear(); auto* track = request.mutable_add_track(); track->set_cid("camera"); track->set_type(livekit::VIDEO); track->set_source(livekit::CAMERA);
     rooms.signal(p, request);
     check(p->tracks.empty() && sink->messages.back().request_response().reason() == livekit::RequestResponse::NOT_ALLOWED, "Publish denial not enforced");
     lk::Claims wrong_room = admin; wrong_room.room = "other";
-    rejected([&] { rooms.api("ListParticipants", {{"room", "demo"}}, wrong_room); }, 403);
+    rejected([&] { rooms.api("ListParticipants", {{"room", "demo"}}, wrong_room); }, 401);
+    const std::string attribute_value(65535, 'a');
+    auto participant_update = lk::Json{{"room", "demo"}, {"identity", claims.identity},
+      {"metadata", large_metadata}, {"attributes", {{"k", attribute_value}}}};
+    rooms.api("UpdateParticipant", participant_update, admin);
+    check(p->info.metadata() == large_metadata && p->info.attributes().at("k") == attribute_value,
+          "Metadata and attribute limits were incorrectly combined");
+    participant_update["metadata"] = "must not apply";
+    participant_update["attributes"]["k"] = attribute_value + "x";
+    rejected([&] { rooms.api("UpdateParticipant", participant_update, admin); }, 400);
+    check(p->info.metadata() == large_metadata && p->info.attributes().at("k") == attribute_value,
+          "Rejected attribute update partially changed participant state");
     auto replacement_sink = std::make_shared<Sink>(); auto replacement = rooms.join(claims, true, replacement_sink);
     check(p->closed && sink->closed && replacement->info.sid() != p->info.sid(), "Duplicate identity not replaced");
     check(replacement_sink->messages.front().join().ice_servers(0).username()!=join_ice[0].username(),
@@ -153,6 +229,27 @@ int main() {
     layered->set_cid("bad-layers"); layered->mutable_layers(1)->set_quality(livekit::LOW);
     rooms.signal(pub,request);
     check(pub->tracks.size()==1 && pub_sink->messages.back().request_response().reason()==livekit::RequestResponse::NOT_ALLOWED,"Duplicate layer quality accepted");
+    auto mute_admin=admin;mute_admin.room="layers";
+    auto mute_request=lk::Json{{"room","layers"},{"identity",pub->info.identity()},{"trackSid",sid},{"muted",true}};
+    rooms.api("MutePublishedTrack",mute_request,mute_admin);
+    check(pub->tracks.at(sid).info.muted(),"Admin mute did not update pending publication");
+    const auto subscriber_updates=sub_sink->messages.size();
+    rooms.api("MutePublishedTrack",mute_request,mute_admin);
+    check(sub_sink->messages.size()==subscriber_updates,"Repeated mute emitted redundant participant updates");
+    mute_request["muted"]=false;const auto publisher_messages=pub_sink->messages.size();
+    rejected([&]{rooms.api("MutePublishedTrack",mute_request,mute_admin);},412);
+    check(pub->tracks.at(sid).info.muted() && pub_sink->messages.size()==publisher_messages,"Rejected remote unmute changed state or sent a signal");
+    config.enable_remote_unmute=true;rooms.api("MutePublishedTrack",mute_request,mute_admin);
+    check(!pub->tracks.at(sid).info.muted(),"Configured remote unmute did not update publication");
+    mute_request["trackSid"]="unknown";
+    check(!rooms.api("MutePublishedTrack",mute_request,mute_admin).contains("track"),"Missing track fabricated a response track");
+    check(pub_sink->messages.back().has_mute() && pub_sink->messages.back().mute().sid()=="unknown","Admin signal for an unknown track was omitted");
+    config.enable_remote_unmute=false;
+    rejected([&]{rooms.api("MutePublishedTrack",mute_request,mute_admin);},412);
+    mute_request["identity"]="missing";
+    rejected([&]{rooms.api("MutePublishedTrack",mute_request,mute_admin);},503);
+    mute_request["room"]="missing";mute_admin.room="missing";
+    rejected([&]{rooms.api("MutePublishedTrack",mute_request,mute_admin);},503);
     request.Clear(); auto* setting=request.mutable_track_setting(); setting->add_track_sids(sid); setting->set_width(600); setting->set_height(300);
     setting->set_priority(1); rooms.signal(sub,request);
     check(sub->track_settings.at(sid).width==600 && sub->track_settings.at(sid).priority==1,"Subscription dimensions/priority not retained before media arrives");
@@ -166,6 +263,33 @@ int main() {
     check(sub->track_settings.size()==1,"Unknown track grew subscription settings");
     rooms.leave(pub);
     check(sub->track_settings.empty() && sub->disabled_tracks.empty(),"Publisher departure retained subscription policy");
+    admin.room = "visibility";
+    rooms.api("CreateRoom", {{"name", "visibility"}, {"maxParticipants", 2}}, admin);
+    auto hidden_claims = claims; hidden_claims.room = "visibility"; hidden_claims.hidden = true;
+    auto hidden_sink = std::make_shared<Sink>(); auto hidden = rooms.join(hidden_claims, true, hidden_sink);
+    auto observer_claims = hidden_claims; observer_claims.identity = "observer"; observer_claims.hidden = false;
+    auto observer_sink = std::make_shared<Sink>(); auto observer = rooms.join(observer_claims, true, observer_sink);
+    check(observer_sink->messages.front().join().other_participants_size() == 0, "Hidden participant leaked in join snapshot");
+    auto recorder_claims = observer_claims; recorder_claims.identity = "recorder"; recorder_claims.kind = "egress";
+    recorder_claims.kind_details = {"CLOUD_AGENT", "unknown", "forwarded"};
+    auto recorder_sink = std::make_shared<Sink>(); auto recorder = rooms.join(recorder_claims, true, recorder_sink);
+    check(recorder->info.kind() == livekit::ParticipantInfo::EGRESS && recorder->info.kind_details_size() == 2,
+          "Participant kind/details were not normalized");
+    check(recorder_sink->messages.front().join().room().num_participants() == 2 &&
+          recorder_sink->messages.front().join().room().active_recording(), "Dependent recorder consumed capacity or recording state missing");
+    check(rooms.api("ListParticipants", {{"room", "visibility"}}, admin)["participants"].size() == 3,
+          "Management API hid hidden or dependent participant");
+    auto over_capacity = observer_claims; over_capacity.identity = "extra";
+    rejected([&] { rooms.join(over_capacity, true, std::make_shared<Sink>()); }, 429);
+    rooms.api("UpdateParticipant", {{"room", "visibility"}, {"identity", hidden->claims.identity}, {"metadata", "private"}}, admin);
+    check(hidden->info.metadata() == "private", "Hidden metadata did not update");
+    rooms.leave(hidden);
+    for (const auto& message : observer_sink->messages) if (message.has_update())
+      for (const auto& participant : message.update().participants())
+        check(participant.identity() != hidden->claims.identity, "Hidden update/departure leaked to observer");
+    rooms.leave(recorder);
+    auto info = rooms.api("ListRooms", {{"names", {"visibility"}}}, admin)["rooms"][0];
+    check(info["numParticipants"] == 1 && !info.value("activeRecording", false), "Recorder exit failed to update room state");
     rooms.shutdown(); io.poll();
     std::cout << "PASS: JWT, permissions, protobuf, native PeerConnection, room lifecycle, duplicate identity and cleanup\n";
   } catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }

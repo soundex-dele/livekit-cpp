@@ -1,0 +1,11 @@
+# Supported Go-compatible fields. Replace the key and secret before deployment.
+# Full Go configuration compatibility is still in progress.
+port: 7880
+bind_addresses: [127.0.0.1]
+keys:
+  your-api-key: "replace-with-a-long-random-secret"
+room:
+  enable_remote_unmute: false
+rtc:
+  port_range_start: 50000
+  port_range_end: 50100

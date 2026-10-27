@@ -20,7 +20,7 @@ class SfuRouter {
 };
 class SfuSession {
  public:
-  SfuSession(SfuRouter&, bool subscriber);
+  SfuSession(SfuRouter&, bool subscriber, bool bidirectional = false);
   ~SfuSession();
   void add(const std::string& sid, const std::string& sender_id,
            webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> source);

@@ -20,8 +20,11 @@ struct Config {
   std::vector<IceServer> ice_servers;
   std::optional<TurnRestAuth> turn_rest;
   size_t max_connections = 256;
+  bool enable_remote_unmute = false;
   std::string media_mode = "sfu";
-  static Config load(const std::string& path);
+  static Config load(const std::string& path, bool complete = true);
+  static Config parse(const std::string& text, bool complete = true);
+  static std::map<std::string,std::string> parse_keys(const std::string& text);
   void validate() const;
   std::vector<IceServer> session_ice_servers(const std::string& session_id, int64_t now = now_ms() / 1000) const;
 };

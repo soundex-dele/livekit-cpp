@@ -1,25 +1,106 @@
 #include "lk/config.hpp"
 #include <fstream>
 #include <cstdlib>
+#include <cmath>
+#include <yaml-cpp/yaml.h>
 namespace lk {
-Config Config::load(const std::string& path) {
+namespace {
+Json yaml_value(const YAML::Node& node, size_t& remaining, unsigned depth=0, bool string_values=false,
+                bool config_document=true, bool boolean_field=false) {
+  if (!remaining-- || depth>64) throw std::runtime_error("Configuration nesting or alias expansion exceeds limit");
+  if (node.IsNull()) return nullptr;
+  if (node.IsMap()) {
+    Json object=Json::object();
+    for (const auto& entry:node) {
+      if (!entry.first.IsScalar()) throw std::runtime_error("Configuration mapping keys must be scalars");
+      auto key=entry.first.as<std::string>();
+      if (object.contains(key)) throw std::runtime_error("Duplicate configuration mapping key");
+      object[key]=yaml_value(entry.second,remaining,depth+1,string_values || (config_document && depth==0 && key=="keys"),
+                            config_document,config_document && depth==1 && key=="enable_remote_unmute");
+    }
+    return object;
+  }
+  if (node.IsSequence()) {
+    Json array=Json::array();
+    for (const auto& entry:node) array.push_back(yaml_value(entry,remaining,depth+1,string_values,config_document));
+    return array;
+  }
+  if (!node.IsScalar()) throw std::runtime_error("Unsupported configuration value");
+  if (string_values || node.Tag()=="!" || node.Tag()=="tag:yaml.org,2002:str") return node.Scalar();
+  bool boolean;
+  const auto scalar=node.Scalar();
+  // Go yaml.v3 resolves yes/no/on/off as strings in map[string]any, but
+  // accepts them for typed bool fields. In particular --keys "key: on"
+  // must keep that string secret, not discard it as a boolean.
+  const bool bool_literal=scalar=="true" || scalar=="True" || scalar=="TRUE" ||
+                          scalar=="false" || scalar=="False" || scalar=="FALSE";
+  if ((boolean_field || bool_literal || node.Tag()=="tag:yaml.org,2002:bool") && YAML::convert<bool>::decode(node,boolean)) return boolean;
+  int64_t integer;
+  if (YAML::convert<int64_t>::decode(node,integer)) return integer;
+  double number;
+  if (YAML::convert<double>::decode(node,number)) {
+    if (!std::isfinite(number)) throw std::runtime_error("Non-finite configuration number");
+    return number;
+  }
+  return node.Scalar();
+}
+Json parse_yaml(const std::string& text,bool config_document=true) {
+  try {
+    const auto documents=YAML::LoadAll(text);
+    if (documents.empty()) return Json::object();
+    if (documents.size()!=1) throw std::runtime_error("Configuration must contain one document");
+    size_t remaining=100000;
+    auto value=yaml_value(documents.front(),remaining,0,false,config_document);
+    if (!value.is_object()) throw std::runtime_error("Configuration must be an object");
+    return value;
+  } catch (const YAML::Exception&) {
+    // Parser messages may quote credentials from the input.
+    throw std::runtime_error("Invalid YAML/JSON configuration");
+  }
+}
+}
+Config Config::load(const std::string& path, bool complete) {
   std::ifstream f(path);
   if (!f) throw std::runtime_error("Cannot read configuration: " + path);
-  Json j; f >> j;
+  return parse(std::string(std::istreambuf_iterator<char>(f),{}),complete);
+}
+std::map<std::string,std::string> Config::parse_keys(const std::string& text) {
+  const auto values=parse_yaml(text,false);
+  std::map<std::string,std::string> keys;
+  // Go's --keys unmarshals map[string]any and retains only string secrets.
+  for (const auto& item:values.items()) if (item.value().is_string()) keys[item.key()]=item.value().get<std::string>();
+  return keys;
+}
+Config Config::parse(const std::string& text, bool complete) {
+  const auto j=parse_yaml(text);
   Config c;
   for (const auto& item : j.items()) {
-    if (item.key() != "bind" && item.key() != "port" && item.key() != "rtc" && item.key() != "keys" && item.key() != "max_connections" && item.key() != "media_mode")
+    if (item.key() != "bind" && item.key() != "bind_addresses" && item.key() != "port" && item.key() != "rtc" && item.key() != "room" && item.key() != "keys" && item.key() != "max_connections" && item.key() != "media_mode")
       throw std::runtime_error("Unknown configuration key: " + item.key());
   }
   c.bind = j.value("bind", c.bind);
+  if (j.contains("bind_addresses")) {
+    if (j.contains("bind")) throw std::runtime_error("Use either bind or bind_addresses");
+    const auto& addresses=j.at("bind_addresses");
+    if (!addresses.is_array() || addresses.size()!=1 || !addresses.front().is_string())
+      throw std::runtime_error("bind_addresses currently requires exactly one address");
+    c.bind=addresses.front().get<std::string>();
+  }
   c.media_mode = j.value("media_mode", c.media_mode);
   auto port = j.value("port", int(c.port));
   if (port < 1 || port > 65535) throw std::runtime_error("port must be 1..65535");
   c.port = static_cast<uint16_t>(port);
-  c.keys = j.at("keys").get<decltype(c.keys)>();
+  if (j.contains("keys")) c.keys = j.at("keys").get<decltype(c.keys)>();
   auto max_connections = j.value("max_connections", 256);
   if (max_connections < 1 || max_connections > 10000) throw std::runtime_error("max_connections must be 1..10000");
   c.max_connections = static_cast<size_t>(max_connections);
+  if (j.contains("room")) {
+    const auto& room = j.at("room");
+    if (!room.is_object()) throw std::runtime_error("room must be an object");
+    for (const auto& item : room.items())
+      if (item.key() != "enable_remote_unmute") throw std::runtime_error("Unknown room configuration key: " + item.key());
+    c.enable_remote_unmute = room.value("enable_remote_unmute", false);
+  }
   if (j.contains("rtc")) {
     auto rtc = j["rtc"];
     if (!rtc.is_object()) throw std::runtime_error("rtc must be an object");
@@ -58,7 +139,7 @@ Config Config::load(const std::string& path) {
       c.turn_rest = std::move(auth);
     }
   }
-  c.validate(); return c;
+  if (complete) c.validate(); return c;
 }
 void Config::validate() const {
   if (media_mode != "sfu" && media_mode != "relay") throw std::runtime_error("media_mode must be sfu or relay");

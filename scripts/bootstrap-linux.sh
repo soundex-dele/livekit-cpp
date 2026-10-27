@@ -39,4 +39,5 @@ checkout() {
 
 checkout protocol https://github.com/livekit/protocol.git f09f87aab29b865850a967924726bf76b7db4755
 checkout protobuf https://github.com/protocolbuffers/protobuf.git f0dc78d7e6e331b8c6bb2d5283e06aa26883ca7c
-printf 'Pinned protocol and Protobuf 21.12 sources are ready.\n'
+checkout yaml-cpp https://github.com/jbeder/yaml-cpp.git f7320141120f720aecc4c32be25586e7da9eb978
+printf 'Pinned protocol, Protobuf 21.12 and yaml-cpp 0.8.0 sources are ready.\n'
