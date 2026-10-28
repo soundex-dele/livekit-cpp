@@ -248,9 +248,9 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
         if (request.method() != http::verb::get) throw Error(405, "bad_route", "GET required");
         auto claims = authenticate(request, target, auth_);
         if (!claims.join || claims.room.empty() || claims.identity.empty()) throw Error(403, "permission_denied", "Room join grant and identity required");
-        if (!claims.studio_grant.empty() && !studio_admitted_) {
+        if ((!claims.studio_grant.empty() || !claims.conference_grant.empty()) && !studio_admitted_) {
           studio_admission(stream_.get_executor(), claims, [self=shared_from_this(), request=std::move(request)](bool allowed) mutable {
-            if (!allowed) { self->respond(401, "{\"code\":\"unauthenticated\",\"msg\":\"Studio admission expired or revoked\"}"); return; }
+            if (!allowed) { self->respond(401, "{\"code\":\"unauthenticated\",\"msg\":\"Admission expired or revoked\"}"); return; }
             self->studio_admitted_ = true; self->handle(std::move(request));
           });
           return;

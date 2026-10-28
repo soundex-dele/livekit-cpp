@@ -13,15 +13,16 @@ struct Check : std::enable_shared_from_this<Check> {
   Check(boost::asio::any_io_executor ex, std::function<void(bool)> cb) : stream(ex), done(std::move(cb)) {}
   void finish(bool ok) { if (done) { auto cb = std::move(done); boost::system::error_code e; stream.socket().close(e); cb(ok); } }
   void run(const Claims& c) {
-    const char* secret = std::getenv("LIVE_STUDIO_ADMISSION_SECRET");
-    const char* configured = std::getenv("LIVE_STUDIO_ADMISSION_PORT");
+    const bool conference = !c.conference_grant.empty();
+    const char* secret = std::getenv(conference ? "CONFERENCE_ADMISSION_SECRET" : "LIVE_STUDIO_ADMISSION_SECRET");
+    const char* configured = std::getenv(conference ? "CONFERENCE_ADMISSION_PORT" : "LIVE_STUDIO_ADMISSION_PORT");
     int port = 8080;
     try { if (configured) port = std::stoi(configured); } catch (...) { finish(false); return; }
     if (!secret || std::string(secret).size() < 24 || port < 1 || port > 65535) { finish(false); return; }
-    request = {http::verb::post, "/api/v1/live-studio/admission", 11};
+    request = {http::verb::post, conference ? "/api/v1/conference/admission" : "/api/v1/live-studio/admission", 11};
     request.set(http::field::host, "127.0.0.1"); request.set(http::field::content_type, "application/json");
     request.set(http::field::authorization, std::string("Bearer ") + secret);
-    request.body() = Json{{"grant", c.studio_grant}, {"room", c.room}, {"identity", c.identity}}.dump(); request.prepare_payload();
+    request.body() = Json{{"grant", conference ? c.conference_grant : c.studio_grant}, {"room", c.room}, {"identity", c.identity}}.dump(); request.prepare_payload();
     response.body_limit(8192); stream.expires_after(std::chrono::seconds(2));
     stream.async_connect({boost::asio::ip::make_address("127.0.0.1"), static_cast<uint16_t>(port)},
       [self=shared_from_this()](boost::system::error_code e) {

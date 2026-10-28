@@ -66,6 +66,7 @@ Claims Auth::verify(const std::string& token, int64_t now) const {
     Claims c;
     c.expires_at = claims.value("exp", int64_t(0));
     c.studio_grant = claims.value("studio_grant", "");
+    c.conference_grant = claims.value("conference_grant", "");
     c.room_preset = claims.value("roomPreset", "");
     if (claims.contains("roomConfig") && !claims["roomConfig"].is_null())
       c.room_config = to_json(from_json<livekit::RoomConfiguration>(claims["roomConfig"]));
@@ -128,6 +129,7 @@ std::string Auth::refresh(const Claims& c, int64_t now) const {
                {"iat", now}, {"nbf", now}, {"exp", std::max(now + 600, c.expires_at)}, {"video", video}};
   const auto kind = c.kind;
   if (!c.studio_grant.empty()) payload["studio_grant"] = c.studio_grant;
+  if (!c.conference_grant.empty()) payload["conference_grant"] = c.conference_grant;
   payload["kind"] = (kind == "ingress" || kind == "egress" || kind == "sip" || kind == "agent" ||
                      kind == "connector" || kind == "bridge") ? kind : "standard";
   if (!c.name.empty()) payload["name"] = c.name;

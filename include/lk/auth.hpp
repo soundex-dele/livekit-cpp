@@ -7,6 +7,7 @@ struct Claims {
   Json video_grant = Json::object(), room_config;
   std::string room_preset;
   std::string studio_grant;
+  std::string conference_grant;
   int64_t expires_at = 0;
   bool join = false, create = false, list = false, admin = false;
   bool publish = true, subscribe = true, publish_data = true, update_metadata = false;
