@@ -22,10 +22,12 @@ const {chromium} = require('playwright');
 const {AccessToken, RoomServiceClient} = require('livekit-server-sdk');
 const {SignalRequest, SignalResponse, RequestResponse_Reason: Reason} = modernRequire('@livekit/protocol');
 const single = opts['single-pc'] === 'true';
+const configured = opts['configured-limits'] === 'true';
+const nameLimit = configured ? 64 : 256, metadataLimit = configured ? 128 : 524288, attributesLimit = configured ? 64 : 65536;
 const out = resolve(opts.output || resolve(here, 'results/go-signal-metadata'), new Date().toISOString().replaceAll(/[:.]/g, '-') + '-' + randomBytes(3).toString('hex'));
 mkdirSync(out, {recursive: true});
 const sha = v => createHash('sha256').update(v).digest('hex');
-const report = {fullReplacementVerified: false, singlePeerConnection: single, servers: {}, comparisons: [],
+const report = {fullReplacementVerified: false, singlePeerConnection: single, configuredLimits: configured, servers: {}, comparisons: [],
   scope: 'Self metadata permissions, atomic limits, request responses, legacy protocol gating and media continuity',
   sdkVersion: JSON.parse(readFileSync(resolve(modern, 'livekit-client/package.json'))).version,
   testSha256: sha(readFileSync(fileURLToPath(import.meta.url)))};
@@ -55,7 +57,7 @@ async function exercise(kind, binary) {
   const record = report.servers[kind] = {binary: resolve(binary), sha256: sha(readFileSync(binary)), cases: []};
   const key = 'metadata', secret = randomBytes(32).toString('hex'), roomName = 'metadata';
   const port = await freePort(), base = `http://127.0.0.1:${port}`;
-  const config = {port, keys: {[key]: secret}, ...(kind === 'go'
+  const config = {port, keys: {[key]: secret}, ...(configured ? {limit: {max_participant_name_length: nameLimit, max_metadata_size: metadataLimit, max_attributes_size: attributesLimit}} : {}), ...(kind === 'go'
     ? {bind_addresses: ['127.0.0.1'], rtc: {tcp_port: 0, port_range_start: 61000, port_range_end: 61100, use_external_ip: false, node_ip: '127.0.0.1', enable_loopback_candidate: true}}
     : {bind: '127.0.0.1', rtc: {port_range_start: 61110, port_range_end: 61210}})};
   record.config = {...config, keys: '[ephemeral, redacted]'};
@@ -137,11 +139,11 @@ async function exercise(kind, binary) {
       return pub.frames.responses.find(r => r.requestId === id);
     }
     const rejectCases = [
-      ['name exceeds byte limit', {name: 'n'.repeat(257), metadata: 'must-not-apply'}, 'exceeds name length limit'],
-      ['UTF-8 name counts bytes', {name: '中'.repeat(86)}, 'exceeds name length limit'],
-      ['metadata exceeds byte limit', {name: 'must-not-apply', metadata: 'm'.repeat(524289)}, 'exceeds metadata size limit'],
-      ['attributes include key bytes', {metadata: 'must-not-apply', attributes: {k: 'a'.repeat(65536)}}, 'exceeds attributes size limit'],
-      ['name precedes other limits', {name: 'n'.repeat(257), metadata: 'm'.repeat(524289), attributes: {k: 'a'.repeat(65536)}}, 'exceeds name length limit'],
+      ['name exceeds byte limit', {name: 'n'.repeat(nameLimit + 1), metadata: 'must-not-apply'}, 'exceeds name length limit'],
+      ['UTF-8 name counts bytes', {name: '中'.repeat(Math.floor(nameLimit / 3) + 1)}, 'exceeds name length limit'],
+      ['metadata exceeds byte limit', {name: 'must-not-apply', metadata: 'm'.repeat(metadataLimit + 1)}, 'exceeds metadata size limit'],
+      ['attributes include key bytes', {metadata: 'must-not-apply', attributes: {k: 'a'.repeat(attributesLimit)}}, 'exceeds attributes size limit'],
+      ['name precedes other limits', {name: 'n'.repeat(nameLimit + 1), metadata: 'm'.repeat(metadataLimit + 1), attributes: {k: 'a'.repeat(attributesLimit)}}, 'exceeds name length limit'],
     ];
     for (const [name, payload, message] of rejectCases) await check(name, async () => {
       const before = await state(), socketCount = pub.frames.reconnects;
@@ -156,28 +158,28 @@ async function exercise(kind, binary) {
       return {reason: response.reason, message: response.message, echo: true, stateUnchanged: true, mediaContinues: true};
     });
     await check('SDK setName rejects with server reason, connection survives', async () => {
-      const result = await pub.page.evaluate(async () => {
-        try { await room.localParticipant.setName('n'.repeat(257)); return {accepted: true}; }
+      const result = await pub.page.evaluate(async nameLimit => {
+        try { await room.localParticipant.setName('n'.repeat(nameLimit + 1)); return {accepted: true}; }
         catch (e) { return {accepted: false, message: e.message}; }
-      });
+      }, nameLimit);
       assert.deepEqual(result, {accepted: false, message: 'exceeds name length limit'}); await media(); return result;
     });
     await check('dynamic revocation precedes limit checks', async () => {
       await api.updateParticipant(roomName, 'publisher', {permission: permission(false)});
       const before = await state(), socketCount = pub.frames.reconnects;
-      const response = await rawUpdate({name: 'n'.repeat(257), metadata: 'm'.repeat(524289)});
+      const response = await rawUpdate({name: 'n'.repeat(nameLimit + 1), metadata: 'm'.repeat(metadataLimit + 1)});
       assert.equal(response.reason, Reason.NOT_ALLOWED); assert.equal(response.message, 'does not have permission to update own metadata');
       await stablePublisher(pub, before, socketCount); await media();
       await api.updateParticipant(roomName, 'publisher', {permission: permission(true)});
       return {reason: response.reason, message: response.message, mediaContinues: true};
     });
     await check('exact name and attribute boundaries accepted', async () => {
-      const response = await rawUpdate({name: 'n'.repeat(256), attributes: {k: 'a'.repeat(65535)}});
+      const response = await rawUpdate({name: 'n'.repeat(nameLimit), attributes: {k: 'a'.repeat(attributesLimit - 1)}});
       assert.equal(response.reason, 0); assert.equal(response.message, '');
-      await eventually(async () => (await api.getParticipant(roomName, 'publisher')).name.length === 256, 'name boundary applied');
-      assert.equal((await api.getParticipant(roomName, 'publisher')).attributes.k.length, 65535);
+      await eventually(async () => (await api.getParticipant(roomName, 'publisher')).name.length === nameLimit, 'name boundary applied');
+      assert.equal((await api.getParticipant(roomName, 'publisher')).attributes.k.length, attributesLimit - 1);
       await pub.page.evaluate(() => room.localParticipant.setAttributes({k: ''})); await media();
-      return {reason: response.reason, nameBytes: 256, attributeBytes: 65536};
+      return {reason: response.reason, nameBytes: nameLimit, attributeBytes: attributesLimit};
     });
     await check('valid SDK update after rejections is seen by peer', async () => {
       await pub.page.evaluate(async () => {
@@ -202,7 +204,7 @@ async function exercise(kind, binary) {
         socket.addEventListener('message', e => received.push(typeof e.data === 'string' ? SignalResponse.fromJsonString(e.data) : SignalResponse.fromBinary(new Uint8Array(e.data))));
         await eventually(() => { if (socketError) throw Error(socketError); return received.some(r => r.message.case === 'join'); }, 'wire join');
         const send = value => socket.send(new SignalRequest({message: value}).toBinary());
-        send({case: 'updateMetadata', value: {requestId: 41, name: 'n'.repeat(257)}});
+        send({case: 'updateMetadata', value: {requestId: 41, name: 'n'.repeat(nameLimit + 1)}});
         send({case: 'updateMetadata', value: {requestId: 42, name: 'accepted'}});
         send({case: 'pingReq', value: {timestamp: 1234n}});
         await eventually(() => received.some(r => r.message.case === 'pongResp'), 'processing barrier');

@@ -24,6 +24,11 @@ struct PublishedTrack {
   Track media;
   std::optional<webrtc::RtpCodecParameters> codec;
   bool subscribed_once = false;
+  int last_subscribed_quality=-2;
+  std::map<std::string,int> last_codec_qualities;
+  std::string regressed_codec;
+  struct Variant {Track media;std::optional<webrtc::RtpCodecParameters> codec;std::string mid;};
+  std::map<std::string,Variant> variants;
 };
 struct Participant {
   Claims claims;
@@ -46,6 +51,10 @@ struct Participant {
   std::chrono::steady_clock::time_point next_token_refresh = std::chrono::steady_clock::now() + std::chrono::minutes(5);
   uint32_t last_published_data_sequence = 0;
   uint32_t last_rtt_ms = 0;
+  std::map<std::string,double> speaker_levels;
+  bool replay_speakers=false;
+  std::map<std::string,int> connection_qualities;
+  std::map<std::string,bool> stream_states;
   void send(const livekit::SignalResponse& response) {
     // Old Rust clients cannot decode these variants; pre-v15 clients expect
     // only error RequestResponses. Keep capability gating in one place.
@@ -53,6 +62,8 @@ struct Participant {
         client_info.sdk() == livekit::ClientInfo::RUST && client_info.protocol() < 10) return;
     if (response.has_request_response() && response.request_response().reason() == livekit::RequestResponse::OK &&
         client_info.protocol() <= 14) return;
+    if(response.has_speakers_changed() && client_info.protocol()<=2)return;
+    if(response.has_connection_quality() && client_info.protocol()<=4)return;
     if (response.has_update()) for (const auto& info : response.update().participants()) {
       auto& cached = update_cache[info.sid()];
       // Resume only needs tombstone identity/version. Do not retain copies of
@@ -80,6 +91,7 @@ class Rooms {
  public:
   Rooms(boost::asio::io_context&, RtcRuntime&, const Config&);
   ~Rooms();
+  void validate_join_names(const Claims&) const;
   std::shared_ptr<Participant> join(const Claims&, bool auto_subscribe, std::shared_ptr<SignalSink>, int single_pc_protocol = -1,
                                     const livekit::ClientInfo& = {});
   std::shared_ptr<Participant> resume(const Claims&, std::shared_ptr<SignalSink>);
@@ -111,6 +123,8 @@ class Rooms {
   void attempt_rpc(const std::shared_ptr<ApiRpc>&);
   void finish_rpc(uint64_t, std::optional<RpcRequests::Result>);
   void tick();
+  void media_tick();
+  int64_t next_quality_update_=0;
   boost::asio::io_context& io_;
   RtcRuntime& rtc_;
   const Config& config_;

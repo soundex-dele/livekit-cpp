@@ -2,6 +2,7 @@
 #include <fstream>
 #include <cstdlib>
 #include <cmath>
+#include <limits>
 #include <yaml-cpp/yaml.h>
 namespace lk {
 namespace {
@@ -58,6 +59,17 @@ Json parse_yaml(const std::string& text,bool config_document=true) {
     throw std::runtime_error("Invalid YAML/JSON configuration");
   }
 }
+int64_t integer_field(const Json& object, const std::string& key, int64_t fallback,
+                      int64_t minimum = INT64_MIN, int64_t maximum = INT64_MAX) {
+  if (!object.contains(key) || object.at(key).is_null()) return fallback;
+  const auto& value = object.at(key);
+  if (!value.is_number_integer() ||
+      (value.is_number_unsigned() && value.get<uint64_t>() > static_cast<uint64_t>(maximum)))
+    throw std::runtime_error(key + " must be an integer in range");
+  const auto number = value.get<int64_t>();
+  if (number < minimum || number > maximum) throw std::runtime_error(key + " must be an integer in range");
+  return number;
+}
 }
 Config Config::load(const std::string& path, bool complete) {
   std::ifstream f(path);
@@ -75,7 +87,7 @@ Config Config::parse(const std::string& text, bool complete) {
   const auto j=parse_yaml(text);
   Config c;
   for (const auto& item : j.items()) {
-    if (item.key() != "bind" && item.key() != "bind_addresses" && item.key() != "port" && item.key() != "rtc" && item.key() != "room" && item.key() != "keys" && item.key() != "max_connections" && item.key() != "media_mode")
+    if (item.key() != "bind" && item.key() != "bind_addresses" && item.key() != "port" && item.key() != "rtc" && item.key() != "room" && item.key() != "keys" && item.key() != "max_connections" && item.key() != "media_mode" && item.key() != "limit")
       throw std::runtime_error("Unknown configuration key: " + item.key());
   }
   c.bind = j.value("bind", c.bind);
@@ -94,19 +106,52 @@ Config Config::parse(const std::string& text, bool complete) {
   auto max_connections = j.value("max_connections", 256);
   if (max_connections < 1 || max_connections > 10000) throw std::runtime_error("max_connections must be 1..10000");
   c.max_connections = static_cast<size_t>(max_connections);
+  if (j.contains("limit") && !j.at("limit").is_null()) {
+    const auto& limits = j.at("limit");
+    if (!limits.is_object()) throw std::runtime_error("limit must be an object");
+    for (const auto& item : limits.items())
+      if (item.key() != "max_room_name_length" && item.key() != "max_participant_identity_length" &&
+          item.key() != "max_participant_name_length" && item.key() != "max_metadata_size" && item.key() != "max_attributes_size")
+        throw std::runtime_error("Unsupported limit configuration key: " + item.key());
+    auto& l = c.limits;
+    l.max_room_name_length = integer_field(limits, "max_room_name_length", l.max_room_name_length);
+    l.max_participant_identity_length = integer_field(limits, "max_participant_identity_length", l.max_participant_identity_length);
+    l.max_participant_name_length = integer_field(limits, "max_participant_name_length", l.max_participant_name_length);
+    l.max_metadata_size = static_cast<uint32_t>(integer_field(limits, "max_metadata_size", l.max_metadata_size, 0, UINT32_MAX));
+    l.max_attributes_size = static_cast<uint32_t>(integer_field(limits, "max_attributes_size", l.max_attributes_size, 0, UINT32_MAX));
+  }
   if (j.contains("room")) {
     const auto& room = j.at("room");
     if (!room.is_object()) throw std::runtime_error("room must be an object");
     for (const auto& item : room.items())
-      if (item.key() != "enable_remote_unmute") throw std::runtime_error("Unknown room configuration key: " + item.key());
+      if (item.key() != "enable_remote_unmute" && item.key() != "max_metadata_size" &&
+          item.key() != "max_room_name_length" && item.key() != "max_participant_identity_length")
+        throw std::runtime_error("Unknown room configuration key: " + item.key());
     c.enable_remote_unmute = room.value("enable_remote_unmute", false);
+    // The pinned Go config copies nonzero legacy room limits over limit.*.
+    const auto metadata = integer_field(room, "max_metadata_size", 0, 0, UINT32_MAX);
+    const auto name = integer_field(room, "max_room_name_length", 0);
+    const auto identity = integer_field(room, "max_participant_identity_length", 0);
+    if (metadata) c.limits.max_metadata_size = static_cast<uint32_t>(metadata);
+    if (name) c.limits.max_room_name_length = name;
+    if (identity) c.limits.max_participant_identity_length = identity;
   }
   if (j.contains("rtc")) {
     auto rtc = j["rtc"];
     if (!rtc.is_object()) throw std::runtime_error("rtc must be an object");
     for (const auto& item : rtc.items())
-      if (item.key() != "port_range_start" && item.key() != "port_range_end" && item.key() != "ice_servers" && item.key() != "turn_rest")
+      if (item.key() != "port_range_start" && item.key() != "port_range_end" && item.key() != "ice_servers" && item.key() != "turn_rest" && item.key() != "congestion_control")
         throw std::runtime_error("Unknown rtc configuration key: " + item.key());
+    if(rtc.contains("congestion_control")){
+      const auto& cc=rtc.at("congestion_control");
+      if(!cc.is_object())throw std::runtime_error("rtc.congestion_control must be an object");
+      for(const auto& item:cc.items()){
+        if(item.key()!="enabled" && item.key()!="allow_pause")throw std::runtime_error("Unsupported rtc.congestion_control key: "+item.key());
+        if(!item.value().is_boolean())throw std::runtime_error("rtc.congestion_control values must be boolean");
+      }
+      c.congestion_control=cc.value("enabled",c.congestion_control);
+      c.allow_video_pause=cc.value("allow_pause",c.allow_video_pause);
+    }
     auto min = rtc.value("port_range_start", int(c.rtc_port_min));
     auto max = rtc.value("port_range_end", int(c.rtc_port_max));
     if (min < 1 || max > 65535 || min > max) throw std::runtime_error("Invalid RTC port range");

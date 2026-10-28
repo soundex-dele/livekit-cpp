@@ -1,6 +1,7 @@
 #pragma once
 #include "lk/video_subscription.hpp"
 #include "lk/config.hpp"
+#include "lk/sfu.hpp"
 #include <boost/asio/io_context.hpp>
 #include <api/peer_connection_interface.h>
 #include <rtc_base/thread.h>
@@ -28,6 +29,7 @@ class RtcRuntime {
   bool ssl_ = false;
 };
 using Track = webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface>;
+struct TrackVariant {Track track;std::optional<webrtc::RtpCodecParameters> codec;};
 struct PeerEvents {
   std::function<void(std::string, std::string, uint32_t)> description;
   std::function<void(std::string)> candidate;
@@ -48,11 +50,12 @@ class Peer : public webrtc::PeerConnectionObserver, public std::enable_shared_fr
   void ice_candidate(const std::string& json);
   void negotiate();
   void restart_ice();
-  void add_track(const std::string& sid, const std::string& participant_sid, Track track, const std::optional<webrtc::RtpCodecParameters>& codec = {});
+  void add_track(const std::string& sid, const std::string& participant_sid, Track track, const std::optional<webrtc::RtpCodecParameters>& codec = {},const std::vector<TrackVariant>& variants = {});
   void remove_track(const std::string& sid);
   void enable_track(const std::string& sid, bool enabled);
   void track_settings(const std::string& sid, const VideoSubscription&);
-  void publication_codec(const std::string& cid,const std::string& codec);
+  void publication_codec(const std::string& cid,const std::string& codec,std::optional<bool> encrypted={});
+  std::map<std::string,MediaSubscriptionState> media_states() const;
   bool send_data(const std::string& bytes, bool reliable);
   void OnSignalingChange(webrtc::PeerConnectionInterface::SignalingState) override {}
   void OnDataChannel(webrtc::scoped_refptr<webrtc::DataChannelInterface>) override;
@@ -84,7 +87,7 @@ class Peer : public webrtc::PeerConnectionObserver, public std::enable_shared_fr
   std::deque<std::string> reliable_queue_;
   size_t reliable_bytes_ = 0;
   std::map<std::string, webrtc::scoped_refptr<webrtc::RtpSenderInterface>> senders_;
-  std::map<std::string, webrtc::RtpCodecParameters> sender_codecs_;
+  std::map<std::string, std::vector<webrtc::RtpCodecParameters>> sender_codecs_;
   std::vector<webrtc::scoped_refptr<webrtc::RtpTransceiverInterface>> pending_tracks_;
   std::map<std::string,std::string> publication_codecs_;
 };

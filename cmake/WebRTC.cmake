@@ -28,7 +28,7 @@ if(WEBRTC_PREBUILT_DIR)
   add_library(livekit_webrtc INTERFACE)
   add_library(WebRTC::webrtc ALIAS livekit_webrtc)
   target_include_directories(livekit_webrtc INTERFACE "${WEBRTC_ROOT}" "${WEBRTC_ROOT}/third_party/abseil-cpp" "${WEBRTC_ROOT}/third_party/libyuv/include")
-  target_compile_definitions(livekit_webrtc INTERFACE WEBRTC_WIN WEBRTC_ALLOW_DEPRECATED_NAMESPACES NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_compile_definitions(livekit_webrtc INTERFACE WEBRTC_WIN RTC_ENABLE_H265 WEBRTC_ALLOW_DEPRECATED_NAMESPACES NOMINMAX WIN32_LEAN_AND_MEAN)
   target_link_libraries(livekit_webrtc INTERFACE ${WEBRTC_STATIC_LIBS} ${WEBRTC_ABSL_LIBS} ${WEBRTC_JSON_LIBS}
     unofficial::libvpx::libvpx ${DAV1D_RELEASE} OpenSSL::SSL OpenSSL::Crypto
     ws2_32 winmm iphlpapi secur32 crypt32 bcrypt dmoguids wmcodecdspuuid amstrmid msdmo ole32 oleaut32 strmiids user32 advapi32 shell32)

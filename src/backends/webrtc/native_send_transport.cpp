@@ -101,8 +101,17 @@ struct NativeSendTransport::Impl : webrtc::PacingController::PacketSender {
       webrtc::ProcessInterval interval; interval.at_time=now; interval.pacer_queue=pacer.QueueSizeData();
       apply(controller->OnProcessInterval(interval)); next_control=now+factory.GetProcessInterval();
     }
-    if (available && pacer.NextSendTime()<=now) pacer.ProcessPackets();
-    auto delay=available ? std::min(pacer.NextSendTime(),next_control)-now : next_control-now;
+    if (available) {
+      // NextSendTime returns its own current time for a newly started probe.
+      // Reading `now` before it can perpetually defer that probe on a real
+      // clock, even though frozen-clock tests pass. Match the native paced
+      // sender's ordering and early-probe margin.
+      const auto next=pacer.NextSendTime();
+      const auto margin=pacer.IsProbing() ? webrtc::PacingController::kMaxEarlyProbeProcessing : webrtc::TimeDelta::Zero();
+      if(next<=env.clock().CurrentTime()+margin)pacer.ProcessPackets();
+    }
+    auto next=available ? std::min(pacer.NextSendTime(),next_control) : next_control;
+    auto delay=next-env.clock().CurrentTime();
     return std::clamp(delay,webrtc::TimeDelta::Millis(1),webrtc::TimeDelta::Millis(10));
   }
   void SendPacket(std::unique_ptr<webrtc::RtpPacketToSend> packet,const webrtc::PacedPacketInfo& info) override {
@@ -236,8 +245,11 @@ void NativeSendTransport::feedback(webrtc::ArrayView<const uint8_t> bytes) {
       }
     } else if (header.type()==webrtc::rtcp::Remb::kPacketType && header.fmt()==webrtc::rtcp::Psfb::kAfbMessageType) {
       webrtc::rtcp::Remb remb;
-      if (remb.Parse(header)) impl_->apply(impl_->controller->OnRemoteBitrateReport(
-        {impl_->env.clock().CurrentTime(),webrtc::DataRate::BitsPerSec(remb.bitrate_bps())}));
+      if (remb.Parse(header)) {
+        RTC_LOG(LS_INFO)<<"SFU remote bitrate transport="<<impl_.get()<<" bps="<<remb.bitrate_bps();
+        impl_->apply(impl_->controller->OnRemoteBitrateReport(
+          {impl_->env.clock().CurrentTime(),webrtc::DataRate::BitsPerSec(remb.bitrate_bps())}));
+      }
     }
     cursor=header.NextPacket();
   }

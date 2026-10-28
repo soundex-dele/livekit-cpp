@@ -9,6 +9,7 @@ struct VideoSubscription {
   int quality=2; // LOW=0, MEDIUM=1, HIGH=2; dimensions take precedence.
   uint32_t width=0,height=0;
   uint32_t priority=0; // 1 is highest; 0 uses the default priority (last).
+  uint32_t fps=0; // Temporal-layer cap; zero leaves the source frame rate intact.
   bool operator==(const VideoSubscription&) const = default;
 };
 struct VideoLayerChoice {

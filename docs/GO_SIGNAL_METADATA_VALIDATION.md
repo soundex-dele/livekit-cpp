@@ -28,7 +28,8 @@
 `SupportsRequestResponse`、`types/protocol_version.go` 及
 `pkg/service/utils.go` 的 `ParseClientInfo`。
 
-这些限制目前仍为默认值；非默认 limit 配置兼容属于 R09 的剩余范围。
+此历史产物只实现默认值；后续五项非默认 limit 配置及真实媒体验证见
+[内容上限配置兼容验证](GO_LIMITS_VALIDATION.md)，完整 R09 仍未完成。
 attributes 校验跟随 Go 对本次请求映射的检查，不宣称对合并后的属性集合
 实施了新的总量限制。没有改动 libwebrtc 或新增媒体流水线。
 

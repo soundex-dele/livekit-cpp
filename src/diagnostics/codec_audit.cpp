@@ -31,8 +31,15 @@ class ForwardingDecoder : public webrtc::VideoDecoder {
 };
 std::vector<webrtc::SdpVideoFormat> forwarding_formats() {
   std::vector<webrtc::SdpVideoFormat> formats{webrtc::SdpVideoFormat("VP8")};
-  for (const char* profile:{"42e01f","42001f","4d001f","640c1f"})
-    formats.emplace_back("H264",webrtc::CodecParameterMap{{"profile-level-id",profile},{"level-asymmetry-allowed","1"},{"packetization-mode","1"}});
+  for (const char* profile:{"0","1","2","3"})
+    formats.emplace_back("VP9",webrtc::CodecParameterMap{{"profile-id",profile}});
+  for (const char* profile:{"0","1","2"})
+    formats.emplace_back("AV1",webrtc::CodecParameterMap{{"profile",profile},{"level-idx","5"},{"tier","0"}});
+  for (const char* profile:{"1","2"})
+    formats.emplace_back("H265",webrtc::CodecParameterMap{{"profile-id",profile},{"tier-flag","0"},{"level-id","120"},{"tx-mode","SRST"}});
+  for (const char* profile:{"42e01f","42001f","4d001f","640c1f","64001f","f4001f"})
+    for (const char* mode:{"1","0"})
+      formats.emplace_back("H264",webrtc::CodecParameterMap{{"profile-level-id",profile},{"level-asymmetry-allowed","1"},{"packetization-mode",mode}});
   return formats;
 }
 class ForwardingEncoders : public webrtc::VideoEncoderFactory {

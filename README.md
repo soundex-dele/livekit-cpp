@@ -4,8 +4,14 @@
 
 2026-10-27 已启动 [Go LiveKit 主服务完整替代](docs/GO_REPLACEMENT.md)：以本地
 1.13.10 为基线，兼容现有 Egress/Ingress/SIP/Agent worker。替代尚未完成。
-最新 [配置入口验证](docs/GO_CONFIG_VALIDATION.md)：YAML/JSON、配置正文和密钥
-环境变量覆盖对照 **16/16**，原生 CTest **9/9**；完整 Go 配置仍未支持。
+最新 [VP9 验证](docs/GO_VP9_VALIDATION.md)：增加 profile 0 原生转发和独立空间层选择，
+L3T3_KEY 混合对照 **20/20**、L1T3 **14/14**、L3T3 选层 **12/12**、原生 **10/10**；
+修复 SVC 的 simulcast 标记和空间层索引。历史失败与未完成项见报告。
+
+此前 [配置上限验证](docs/GO_LIMITS_VALIDATION.md)：五项内容上限与旧配置覆盖对照
+**118/118**，非默认上限的 SDK 单／双 PC 各 **15/15**，原生 CTest **10/10**。
+[配置入口验证](docs/GO_CONFIG_VALIDATION.md) 的 YAML/JSON、正文和密钥覆盖
+**16/16** 回归通过；完整 Go 配置仍未支持。
 [音频编码验证](docs/GO_AUDIO_CODEC_VALIDATION.md)：PCMU/PCMA 8 kHz 与 Opus
 混合，单/双 PC 实际音调解码对照 **18/18**。后续视频回归出现间歇失败，详见记录。
 [静音策略验证](docs/GO_MUTE_VALIDATION.md)：默认/显式开启/显式关闭共 **63/63**，
@@ -27,7 +33,7 @@
 
 使用 C++20 实现的 LiveKit **单机服务端兼容项目**。原生 WebRTC 直接来自 `D:\workspace\webrtc`，不启动 Go 服务，也不经由 Rust FFI。
 
-默认媒体链路是 **基于 libwebrtc 原生模块的 RTP 包级 SFU**，支持 Opus / PCMU / PCMA / VP8 / H.264 mode 1 / RTX，以及最多三层 VP8 simulcast 的订阅选层。转发保留编码帧内容，服务端视频编解码调用数通过集成测试检查为零。NACK、RTX、PLI、重传缓存、RTCP 解析和上行拥塞反馈复用 libwebrtc。下行复用原生 pacing 和 GoogCC，应用层根据其预算进行音频预留、视频优先级分配和升降层。容量及完整弱网验收仍待完成，当前吞吐量不能按商业 RTC 产品估算。完整实施范围见 [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md)。
+默认媒体链路是 **基于 libwebrtc 原生模块的 RTP 包级 SFU**，支持 Opus / PCMU / PCMA / VP8 / H.264 mode 1 / VP9 profile 0 / RTX，以及最多三层 VP8 simulcast 和 VP9 SVC 的手动空间选层。转发保留编码帧内容，服务端视频编解码调用数通过集成测试检查为零。NACK、RTX、PLI、重传缓存、RTCP 解析和上行拥塞反馈复用 libwebrtc。下行复用原生 pacing 和 GoogCC，应用层根据其预算进行音频预留、视频优先级分配和升降层。容量及完整弱网验收仍待完成，当前吞吐量不能按商业 RTC 产品估算。完整实施范围见 [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md)。
 
 配置 `"media_mode": "relay"` 可运行原先的解码重编码链路，默认值为 `"sfu"`。SFU 内部适配器依赖相邻 M137 WebRTC 的内部接口；升级 WebRTC 时必须重新验证，当前不宣称生产就绪。
 
@@ -131,6 +137,13 @@ Copy-Item config/config.example.json config.local.json
 `bind_addresses: [127.0.0.1]`；多监听地址以及顶层、room、rtc 的未知字段会明确拒绝。
 默认监听地址和 RTC 端口范围仍沿用本 C++ 服务默认值，完整 Go 配置兼容未完成。
 
+支持 `limit.max_room_name_length`、`max_participant_identity_length`、
+`max_participant_name_length`、`max_metadata_size` 和 `max_attributes_size`，
+默认分别为 256、256、256、524288、65536 字节。`0` 取消对应内容上限；
+HTTP／WebSocket 传输大小仍有独立限制。旧 `room.max_room_name_length`、
+`room.max_participant_identity_length`、`room.max_metadata_size` 的非零值会覆盖
+对应 `limit` 值，与固定 Go 基线一致。其他尚未实现的 `limit` 字段会明确拒绝启动。
+
 公网部署需在反向代理配置 HTTPS/WSS，并根据网络情况配置可达的 STUN/TURN。当前不含内置 TURN 或公网 IP 重写功能。不要将示例配置中的占位密钥直接用于部署。
 
 ```js
@@ -164,11 +177,13 @@ await room.localParticipant.setMicrophoneEnabled(true);
 | 生命周期 | 重复 identity 替换、房间容量、空房超时、心跳超时、关闭清理 |
 | 运维 | JSON 配置、`/healthz`、需 roomList 权限的 `/metrics`、退出信号处理 |
 
-暂不支持订阅帧率限制、RED/ULPFEC、SVC 时空层选择、dynacast、E2EE 媒体转发、无缝会话恢复、单 PeerConnection `/rtc/v1`、Redis 集群、内置 TURN、Egress/Ingress、SIP、Agent 调度、Webhook、说话人检测及新式 data track/blob API。SFU 通过原生 CodecPreferences 明确协商 Opus / VP8 / RTX，不宣告尚未接入的编码或 FEC 能力。断线恢复使用完整重连。隐藏参与者及媒体 ACL 已支持，data track/blob ACL 仍未支持；参与者 kind 支持不代表对应外部 worker 已完成联调。
+已接入 FPS/空间与时间层分配、dynacast、备用编码策略、Opus RED、不解密转发、说话人和连接质量事件；编码协商覆盖 VP8、VP9、AV1、H.264 mode 0/1、多 profile 与 H.265 SRST。单 PC `/rtc/v1`、信令恢复与 ICE restart 也已有实现。实现状态与真实 SDK 验证范围见 [媒体兼容记录](docs/GO_MEDIA_COMPATIBILITY.md)，仍有失败组合，不能据此宣布完整替代。视频 ULPFEC、Redis 集群、内置 TURN、外部 Egress/Ingress/SIP/Agent 控制面、Webhook 和新式 data track 仍未完成。隐藏参与者及媒体 ACL 已支持；参与者 kind 支持不代表外部 worker 已完成联调。
+
+最新媒体增量已通过 RED/混合音频与事件 22/22、加密混合音频 22/22，以及两种备用回退策略各 16/16 的单/双 PC 对照。修复包含音频协商优先级、加密状态登记、密文格式保持和同 SSRC 切换的 RTP 连续性。H.265 静音恢复、FPS 估计差异和历史间歇层升级仍未关闭；各产物的精确范围与失败记录见上述媒体兼容记录。
 
 订阅者可调用官方 Web SDK 的 `publication.setVideoQuality(VideoQuality.LOW)` 或 `publication.setVideoDimensions({width:600,height:300})`。宽高优先于 quality，以满足尺寸的最小可用层作为请求上限；实际层还受共享带宽限制，单层发布无法凭空产生低清层。LOW/MEDIUM/HIGH 对应发布端从低到高的协商层顺序，与官方 LiveKit SDK 一致。等待目标层关键帧时，仅在旧层仍符合预算的情况下继续转发；订阅 SSRC 不变。层连续 2 秒无完整帧时回退到可用层。设置跨退订/重订保留。
 
-每 200 ms 分配一次原生目标码率的 85%，先为每条音频预留至少 64 kbps（测得需求更高时按需求），再分配视频基础层，最后升级高优先级视频。`TrackSettings.priority=1` 最高；显式优先级优先于未设置的轨道，未设置或同优先级按订阅顺序处理。各视频层通过原生 `RateStatistics` 测量唯一完整编码帧的码率，含估算传输开销；初始使用尺寸/层级对应的保守需求值。降层在下一分配周期执行，升层/带宽暂停后的恢复要求额外 15% 余量持续一秒。音频需求超过总预算时停止分配视频，但无法保证超出链路容量的全部音频都能送达。
+每 200 ms 按原生目标码率的 85% 规划分层预算，先为音频预留至少 64 kbps，再分配视频基础层及高优先级升级。`TrackSettings.priority=1` 最高；同优先级按订阅顺序处理。码率来自唯一完整帧的原生 `RateStatistics`，含估算开销。`rtc.congestion_control.allow_pause` 默认 `false`，与固定 Go 一致：预算不足仍保留可用基础层，因此分配需求可高于预算；实际发包由原生 pacing 限制。设为 `true` 后，基础层不足时允许暂停，恢复需持续余量。`enabled: false` 关闭带宽驱动选层，保留用户质量/尺寸上限。以上均不能保证超出实际链路容量的媒体送达。
 
 带宽暂停会清除该视频的排队和重传缓存，恢复必须等待关键帧。用户静音停发媒体和探测；带宽暂停保留原生 padding，并通过 `StreamsConfig.max_padding_rate` 提供上限，具体发送速率、探测和反馈处理仍由 libwebrtc 决定。当已分配需求低于原生目标的 60% 时不额外填充，保留原生 ALR 探测所需的空闲带宽。`sfu_media_budget_bps`、`sfu_audio_reserved_bps`、`sfu_video_allocated_bps` 是活动传输最近一次分配的合计；`sfu_video_budget_paused` 为当前无视频分配的订阅数，`sfu_bandwidth_pauses` 为已分配视频变为暂停的累计次数。
 
@@ -177,7 +192,7 @@ await room.localParticipant.setMicrophoneEnabled(true);
 所有分配始终受同一个原生目标预算约束。用户尺寸上限或源层失活导致当前层
 消失时，直接回退到剩余可用且可负担的层，避免先回基础层再等待升层。
 
-`sfu_layers_discovered` 统计已发现的视频源 SSRC，`sfu_layer_switches` 统计订阅切层，`sfu_unmapped_packets` 统计尚未能绑定到协商层的包（例如主流 RID 首包前到达的 RTX）。接收协商和 RID 扩展识别均使用原生 JSEP/RTP 对象；RID 替代层、超过三层和 SVC 发布模式不支持。
+`sfu_layers_discovered` 统计已发现的视频源 SSRC，`sfu_layer_switches` 统计订阅切层，`sfu_unmapped_packets` 统计尚未绑定到协商层的包。接收协商和 RID 扩展使用原生 JSEP/RTP 对象；支持最多三条 simulcast 源及已接入编码的 SVC 路径，RID 替代编码组仍未完成。
 
 下行指标包括 `sfu_target_bps` / `sfu_pacing_bps`（活动传输的合计预算）、`sfu_downstream_feedback` / `sfu_feedback_packets`（已关联发送记录的 TWCC 反馈）、`sfu_padding_sent`、`sfu_pacer_queue_bytes` / `sfu_pacer_queue_ms`（合计排队字节 / 最大预计等待时间），以及 `sfu_pacer_admission_drops`。每条传输的媒体入队预算为 4 MiB；视频帧整批接受或拒绝，拒绝后请求关键帧恢复，视频与重传超时由原生队列处理。该保护不代替带宽选层，不能据此宣称弱网质量已达标。
 

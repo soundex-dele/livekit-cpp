@@ -18,6 +18,12 @@ struct Sink : lk::SignalSink {
   void close() override { closed = true; }
 };
 void allocation_test() {
+  std::vector<lk::VideoBandwidthRequest> continuous{{"a",0,{{11,400000},{12,900000}}},{"b",0,{{21,300000}}}};
+  auto continuous_budget=lk::allocate_video_bandwidth(100000,64000,0,continuous,false);
+  check(continuous[0].state.selected==11 && continuous[1].state.selected==21 && continuous_budget.paused==0,
+        "Go allow_pause=false must preserve every available base layer under shortage");
+  continuous[0].layers.clear();lk::allocate_video_bandwidth(100000,64000,200,continuous,false);
+  check(!continuous[0].state.selected && continuous[1].state.selected==21,"No-pause policy allocated an inactive source");
   std::vector<lk::VideoBandwidthRequest> startup{{"new",0,{}}};
   lk::allocate_video_bandwidth(300000,64000,0,startup);
   startup[0].layers={{11,300000}};
@@ -110,6 +116,10 @@ int main() {
     rejected([&] { auth.verify(token + ".extra", 1500); }, 401);
     payload["video"]["canPublishData"] = false;
     check(!auth.verify(lk::Auth::sign(payload, "secret"), 1500).publish_data, "Data permission ignored");
+    auto large_token_payload = payload;
+    large_token_payload["metadata"] = std::string(65536, 'm');
+    check(auth.verify(lk::Auth::sign(large_token_payload, "secret"), 1500).metadata.size() == 65536,
+          "Valid JWT metadata below Go limits rejected by an unrelated token cap");
     payload["video"]["destinationRoom"] = "target";
     check(auth.verify(lk::Auth::sign(payload, "secret"), 1500).destination_room == "target", "Destination room grant ignored");
     payload["video"]["recorder"] = true;
@@ -269,6 +279,28 @@ int main() {
     layered->set_cid("bad-layers"); layered->mutable_layers(1)->set_quality(livekit::LOW);
     rooms.signal(pub,request);
     check(pub->tracks.size()==1 && pub_sink->messages.back().request_response().reason()==livekit::RequestResponse::NOT_ALLOWED,"Duplicate layer quality accepted");
+    const auto pending_messages = pub_sink->messages.size(), pending_peer_messages = sub_sink->messages.size();
+    request.Clear(); auto* video_update = request.mutable_update_video_track();
+    video_update->set_track_sid(sid); video_update->set_width(640); video_update->set_height(360);
+    rooms.signal(pub, request);
+    check(pub->tracks.at(sid).info.width()==640 && pub->tracks.at(sid).info.height()==360,
+          "Pending video dimensions were not retained");
+    request.Clear(); auto* audio_update = request.mutable_update_audio_track(); audio_update->set_track_sid(sid);
+    for (int feature : {5, 1, 0, 5, 99, 1}) audio_update->add_features(static_cast<livekit::AudioTrackFeature>(feature));
+    rooms.signal(pub, request);
+    const auto& pending_info = pub->tracks.at(sid).info;
+    check(pending_info.stereo() && pending_info.disable_dtx() && pending_info.audio_features_size()==4 &&
+          pending_info.audio_features(0)==livekit::TF_STEREO && pending_info.audio_features(3)==99,
+          "Pending audio features were not sorted, deduplicated and synchronized");
+    audio_update->clear_features(); rooms.signal(pub, request);
+    check(!pending_info.stereo() && !pending_info.disable_dtx() && pending_info.audio_features().empty(),
+          "Empty feature update did not reset pending flags");
+    check(pub_sink->messages.size()==pending_messages && sub_sink->messages.size()==pending_peer_messages,
+          "Pending updates emitted premature events or success responses");
+    rooms.signal(sub, request);
+    check(sub_sink->messages.back().request_response().reason()==livekit::RequestResponse::NOT_FOUND &&
+          sub_sink->messages.back().request_response().update_audio_track().SerializeAsString()==request.update_audio_track().SerializeAsString(),
+          "Foreign track update did not return original request with NOT_FOUND");
     auto mute_admin=admin;mute_admin.room="layers";
     auto mute_request=lk::Json{{"room","layers"},{"identity",pub->info.identity()},{"trackSid",sid},{"muted",true}};
     rooms.api("MutePublishedTrack",mute_request,mute_admin);
@@ -296,7 +328,7 @@ int main() {
     setting->set_disabled(true); rooms.signal(sub,request);
     check(sub->disabled_tracks.contains(sid),"Subscription disable setting ignored");
     setting->set_disabled(false); setting->set_fps(10); rooms.signal(sub,request);
-    check(sub_sink->messages.back().request_response().reason()==livekit::RequestResponse::UNSUPPORTED_TYPE && sub->disabled_tracks.contains(sid),"Unsupported fps partially applied settings");
+    check(sub->track_settings.at(sid).fps==10 && !sub->disabled_tracks.contains(sid),"FPS setting or re-enable was not retained");
     setting->set_fps(0); setting->set_width(16385);
     rejected([&]{rooms.signal(sub,request);},400);
     setting->set_width(600); setting->clear_track_sids(); setting->add_track_sids("unknown"); rooms.signal(sub,request);

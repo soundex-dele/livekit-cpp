@@ -250,7 +250,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
       if (target.path == "/rtc" || target.path == "/rtc/validate" || target.path == "/rtc/v1" || target.path == "/rtc/v1/validate") {
         if (request.method() != http::verb::get) throw Error(405, "bad_route", "GET required");
         auto claims = authenticate(request, target, auth_);
-        if (!claims.join || claims.room.empty() || claims.identity.empty()) throw Error(403, "permission_denied", "Room join grant and identity required");
+        if (!claims.join) throw Error(403, "permission_denied", "Room join grant required");
         if ((!claims.studio_grant.empty() || !claims.conference_grant.empty()) && !studio_admitted_) {
           studio_admission(stream_.get_executor(), claims, [self=shared_from_this(), request=std::move(request)](bool allowed) mutable {
             if (!allowed) { self->respond(401, "{\"code\":\"unauthenticated\",\"msg\":\"Admission expired or revoked\"}"); return; }
@@ -268,6 +268,8 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
           if (!join_request->metadata().empty()) claims.metadata = join_request->metadata();
           for (const auto& [key, value] : join_request->participant_attributes()) if (!value.empty()) claims.attributes[key] = value;
         }
+        try { rooms_.validate_join_names(claims); }
+        catch (const Error& error) { respond(error.status, error.what(), "text/plain; charset=utf-8"); return; }
         if (target.path.ends_with("/validate")) { respond(200, "success", "text/plain"); return; }
         if (!ws::is_upgrade(request)) throw Error(400, "invalid_argument", "WebSocket upgrade required");
         auto session = std::make_shared<WebSocketSession>(std::move(stream_), rooms_, count_);

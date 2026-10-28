@@ -1,5 +1,8 @@
 #include "lk/rooms.hpp"
 #include "lk/media_codec.hpp"
+#include "lk/sfu.hpp"
+#include "lk/media_quality.hpp"
+#include <cmath>
 #include <boost/asio/post.hpp>
 #include <algorithm>
 #include <cctype>
@@ -12,19 +15,19 @@ void require(bool ok) { if (!ok) throw Error(403, "permission_denied", "Permissi
 // signaling permission contract separate from the management API contract.
 void require_api(bool ok) { if (!ok) throw Error(401, "unauthenticated", "permissions denied"); }
 void name_limit(const std::string& s) { if (s.empty() || s.size() > 256) throw Error(400, "invalid_argument", "Name or identity must contain 1..256 bytes"); }
-void api_limit(size_t size, size_t limit, const std::string& argument) {
-  if (size > limit) throw Error(400, "invalid_argument", argument + " " + std::to_string(limit), {{"argument", argument}});
+void api_limit(size_t size, int64_t limit, const std::string& argument) {
+  if (Limits::exceeded(size, limit)) throw Error(400, "invalid_argument", argument + " " + std::to_string(limit), {{"argument", argument}});
 }
-void metadata_limit(const std::string& s) { api_limit(s.size(), 512 * 1024, "metadata size exceeds limits"); }
-void attributes_limit(const google::protobuf::Map<std::string, std::string>& attrs) {
+void metadata_limit(const std::string& s, const Limits& limits) { api_limit(s.size(), limits.max_metadata_size, "metadata size exceeds limits"); }
+void attributes_limit(const google::protobuf::Map<std::string, std::string>& attrs, const Limits& limits) {
   size_t bytes = 0;
   for (const auto& [key, value] : attrs) bytes += key.size() + value.size();
-  api_limit(bytes, 65536, "attribute size exceeds limits");
+  api_limit(bytes, limits.max_attributes_size, "attribute size exceeds limits");
 }
-void attributes_limit(const Json& attrs) {
+void attributes_limit(const Json& attrs, const Limits& limits) {
   size_t bytes = 0;
   for (const auto& item : attrs.items()) bytes += item.key().size() + item.value().get_ref<const std::string&>().size();
-  api_limit(bytes, 65536, "attribute size exceeds limits");
+  api_limit(bytes, limits.max_attributes_size, "attribute size exceeds limits");
 }
 bool valid_layers(const google::protobuf::RepeatedPtrField<livekit::VideoLayer>& layers) {
   if (layers.size()>3) return false;
@@ -34,16 +37,24 @@ bool valid_layers(const google::protobuf::RepeatedPtrField<livekit::VideoLayer>&
         layer.width()>16384 || layer.height()>16384 || layer.rid().size()>16) return false;
   return true;
 }
+void normalize_codec_layers(livekit::SimulcastCodecInfo& codec) {
+  if(codec.video_layer_mode()!=livekit::VideoLayer::MULTIPLE_SPATIAL_LAYERS_PER_STREAM)return;
+  auto* layers=codec.mutable_layers();
+  std::sort(layers->begin(),layers->end(),[](const auto& a,const auto& b){return uint64_t(a.width())*a.height()<uint64_t(b.width())*b.height();});
+  for(int i=0;i<layers->size();++i)layers->Mutable(i)->set_spatial_layer(i);
+}
 template <typename T> bool contains(const T& values, const std::string& value) { return std::find(values.begin(), values.end(), value) != values.end(); }
 void codecs(livekit::Room& room,bool forwarding) {
   for (auto mime : {"audio/opus", "video/VP8"}) room.add_enabled_codecs()->set_mime(mime);
-  if (forwarding) for (auto mime:{"audio/PCMU","audio/PCMA","video/H264"}) room.add_enabled_codecs()->set_mime(mime);
+  if (forwarding) for (auto mime:{"audio/PCMU","audio/PCMA","video/H264","video/VP9","video/AV1","video/H265","audio/red"}) room.add_enabled_codecs()->set_mime(mime);
 }
 void attributes(livekit::ParticipantInfo& info, const google::protobuf::Map<std::string, std::string>& attrs) {
   for (const auto& [k, v] : attrs) { if (v.empty()) info.mutable_attributes()->erase(k); else (*info.mutable_attributes())[k] = v; }
 }
 }
-Rooms::Rooms(boost::asio::io_context& io, RtcRuntime& rtc, const Config& config) : io_(io), rtc_(rtc), config_(config), timer_(io), rpc_(io) { tick(); }
+Rooms::Rooms(boost::asio::io_context& io, RtcRuntime& rtc, const Config& config) : io_(io), rtc_(rtc), config_(config), timer_(io), rpc_(io) {
+  rtc_.sfu->configure_congestion_control(config_.congestion_control,config_.allow_video_pause);tick();
+}
 Rooms::~Rooms() { shutdown(); }
 Room& Rooms::room(const std::string& name) {
   auto it = rooms_.find(name); if (it == rooms_.end()) throw Error(404, "not_found", "requested room does not exist"); return it->second;
@@ -54,8 +65,9 @@ std::shared_ptr<Participant> Rooms::participant(Room& room, const std::string& i
 Room& Rooms::create(const livekit::CreateRoomRequest& req) {
   // The pinned Go CreateRoom API accepts an empty name; the RTC join path
   // separately requires a non-empty room and identity.
-  if (req.name().size() > 256) throw Error(400, "invalid_argument", "room name length exceeds limits: max length 256");
-  metadata_limit(req.metadata());
+  if (Limits::exceeded(req.name().size(), config_.limits.max_room_name_length))
+    throw Error(400, "invalid_argument", "room name length exceeds limits: max length " + std::to_string(config_.limits.max_room_name_length));
+  metadata_limit(req.metadata(), config_.limits);
   if (!req.room_preset().empty()) throw Error(400, "invalid_argument", "unknown room configuration in create room request");
   if (req.has_egress() || !req.agents().empty()) throw Error(501, "unimplemented", "Egress and agents are not supported");
   auto [it, inserted] = rooms_.try_emplace(req.name());
@@ -114,9 +126,17 @@ void Rooms::update_metadata(const std::shared_ptr<Participant>& p, const std::st
     updated(p); refresh_token(p);
   }
 }
+void Rooms::validate_join_names(const Claims& claims) const {
+  if (claims.identity.empty()) throw Error(400, "invalid_argument", "identity cannot be empty");
+  if (Limits::exceeded(claims.identity.size(), config_.limits.max_participant_identity_length))
+    throw Error(400, "invalid_argument", "participant identity length exceeds limits: max length " + std::to_string(config_.limits.max_participant_identity_length));
+  if (claims.room.empty()) throw Error(400, "invalid_argument", "no room name");
+  if (Limits::exceeded(claims.room.size(), config_.limits.max_room_name_length))
+    throw Error(400, "invalid_argument", "room name length exceeds limits: max length " + std::to_string(config_.limits.max_room_name_length));
+}
 std::shared_ptr<Participant> Rooms::join(const Claims& claims, bool auto_subscribe, std::shared_ptr<SignalSink> sink, int single_pc_protocol,
                                       const livekit::ClientInfo& client_info) {
-  require(claims.join); name_limit(claims.room); name_limit(claims.identity); metadata_limit(claims.metadata); attributes_limit(claims.attributes);
+  require(claims.join); validate_join_names(claims); metadata_limit(claims.metadata, config_.limits); attributes_limit(claims.attributes, config_.limits);
   if (stopping_) throw Error(503, "unavailable", "Server is stopping");
   livekit::CreateRoomRequest create_req; create_req.set_name(claims.room);
   auto& r = create(create_req);
@@ -178,7 +198,15 @@ std::shared_ptr<Participant> Rooms::join(const Claims& claims, bool auto_subscri
       events.track = [this, weak](Track track, std::string mid,webrtc::RtpParameters parameters) { if (auto p = weak.lock(); p && !p->closed) received_track(p, track, mid,parameters); };
       events.remove_track = [this, weak](std::string cid) {
         if (auto p = weak.lock(); p && !p->closed) {
-          for (const auto& [sid, t] : p->tracks) if (t.cid == cid || (t.media && t.media->id() == cid)) { auto id = sid; unpublish(p, id); break; }
+          for (auto& [sid, t] : p->tracks) {
+            if (t.cid == cid || (t.media && t.media->id() == cid)) { auto id = sid; unpublish(p, id); break; }
+            if(auto variant=t.variants.find(cid);variant!=t.variants.end()) {
+              variant->second.media=nullptr;variant->second.codec.reset();variant->second.mid.clear();
+              for(auto& codec:*t.info.mutable_codecs())if(codec.cid()==cid){codec.clear_mid();for(auto& layer:*codec.mutable_layers())layer.clear_ssrc();}
+              for(auto& [_,other]:room(p->claims.room).participants)if(other!=p && other->claims.subscribe && (other->subscriptions.contains(sid)?other->subscriptions.at(sid):other->auto_subscribe))subscribe(other,sid,true);
+              updated(p);break;
+            }
+          }
         }
       };
       events.data = [this, weak](std::string bytes, bool reliable) {
@@ -246,6 +274,9 @@ std::shared_ptr<Participant> Rooms::resume(const Claims& claims, std::shared_ptr
     server->set_username(ice.username); server->set_credential(ice.credential);
   }
   p->send(response); // This must precede all replay and negotiation messages.
+  p->stream_states.clear();
+  p->replay_speakers=true;p->connection_qualities.clear();
+  for(auto& [_,track]:p->tracks){track.last_subscribed_quality=-2;track.last_codec_qualities.clear();}
   response.Clear();
   for (const auto& [_, cached] : p->update_cache)
     if (cached.at >= last_signal - 3000 && cached.info.state() == livekit::ParticipantInfo::DISCONNECTED)
@@ -297,12 +328,26 @@ void Rooms::leave(const std::shared_ptr<Participant>& input, livekit::Disconnect
 }
 void Rooms::received_track(const std::shared_ptr<Participant>& p, Track track, const std::string& mid,const webrtc::RtpParameters& parameters) {
   for (auto& [sid, t] : p->tracks) {
-    if (t.cid != track->id() && t.mid != mid) continue;
+    if (t.cid != track->id() && t.mid != mid) {
+      auto variant=t.variants.find(track->id());if(variant==t.variants.end())continue;
+      variant->second.media=track;variant->second.mid=mid;variant->second.codec=primary_media_codec(parameters,track->kind()=="audio");
+      if(!variant->second.codec){leave(p,livekit::MEDIA_FAILURE);return;}
+      for(auto& codec:*t.info.mutable_codecs())if(codec.cid()==track->id()){codec.set_mid(mid);codec.set_mime_type(track->kind()+"/"+variant->second.codec->name);}
+      updated(p);
+      for(const auto& [_,other]:room(p->claims.room).participants)if(other!=p && other->claims.subscribe && (other->subscriptions.contains(sid)?other->subscriptions[sid]:other->auto_subscribe))subscribe(other,sid,true);
+      return;
+    }
     t.media = track; t.mid = mid; t.info.set_mid(mid);
     t.codec=primary_media_codec(parameters,track->kind()=="audio");
     if (config_.media_mode=="sfu" && !t.codec) { leave(p,livekit::MEDIA_FAILURE); return; }
     t.info.set_mime_type(track->kind()+"/"+(t.codec ? t.codec->name : (track->kind()=="audio" ? "opus" : "VP8")));
-    for (auto& codec:*t.info.mutable_codecs()) { codec.set_mid(mid); codec.set_mime_type(t.info.mime_type()); }
+    // RED is the negotiated transport codec, with Opus retained internally for
+    // payload conversion and downstream capability matching.
+    if(track->kind()=="audio")for(const auto& negotiated:parameters.codecs){
+      if(codec_name(negotiated.name)=="red" && negotiated.clock_rate==48000){t.info.set_mime_type("audio/red");break;}
+      if(forwarding_codec(negotiated))break;
+    }
+    for (auto& codec:*t.info.mutable_codecs()) if(codec.cid()==t.cid) { codec.set_mid(mid); codec.set_mime_type(t.info.mime_type()); }
     updated(p);
     for (auto& [_, other] : room(p->claims.room).participants) if (other != p && other->claims.subscribe) {
       bool desired = other->subscriptions.contains(sid) ? other->subscriptions[sid] : other->auto_subscribe;
@@ -316,6 +361,7 @@ void Rooms::received_track(const std::shared_ptr<Participant>& p, Track track, c
 void Rooms::unpublish(const std::shared_ptr<Participant>& p, const std::string& sid) {
   auto it = p->tracks.find(sid); if (it == p->tracks.end()) return;
   p->publisher->publication_codec(it->second.cid,"");
+  for(const auto& [cid,_]:it->second.variants)p->publisher->publication_codec(cid,"");
   for (auto& [_, other] : room(p->claims.room).participants) if (other != p) {
     other->subscriber->remove_track(sid); other->track_settings.erase(sid);
     other->disabled_tracks.erase(sid); other->subscriptions.erase(sid);
@@ -340,7 +386,19 @@ void Rooms::subscribe(const std::shared_ptr<Participant>& p, const std::string& 
       p->send(response);
     }
     if (!allowed) { p->subscriber->remove_track(sid); return; }
-    p->subscriber->add_track(sid, other->info.sid(), t->second.media,t->second.codec);
+    std::vector<TrackVariant> variants;
+    for(const auto& [_,variant]:t->second.variants)if(variant.media && variant.codec)variants.push_back({variant.media,variant.codec});
+    for(const auto& advertised:t->second.info.codecs()) {
+      auto name=codec_name(advertised.mime_type());
+      if(t->second.codec && codec_name(t->second.codec->name)==name)continue;
+      if(std::any_of(variants.begin(),variants.end(),[&](const auto& v){return v.codec && codec_name(v.codec->name)==name;}))continue;
+      webrtc::RtpCodecParameters fallback;fallback.name=name;fallback.clock_rate=90000;
+      if(name=="h264")fallback.parameters={{"packetization-mode","1"},{"profile-level-id","42e01f"}};
+      variants.push_back({{},fallback});
+    }
+    auto media=t->second.media;auto codec=t->second.codec;
+    if(!t->second.regressed_codec.empty())for(const auto& [_,variant]:t->second.variants)if(variant.media && variant.codec && codec_name(variant.codec->name)==t->second.regressed_codec){media=variant.media;codec=variant.codec;variants.clear();break;}
+    p->subscriber->add_track(sid, other->info.sid(), media,codec,variants);
     if (auto settings=p->track_settings.find(sid);settings!=p->track_settings.end()) p->subscriber->track_settings(sid,settings->second);
     p->subscriber->enable_track(sid, !t->second.info.muted() && !p->disabled_tracks.contains(sid));
     return;
@@ -421,31 +479,85 @@ void Rooms::signal(const std::shared_ptr<Participant>& p, const livekit::SignalR
       bool layers_valid=valid_layers(a.layers()) && a.simulcast_codecs_size()<=3;
       for (const auto& codec:a.simulcast_codecs())
         layers_valid=layers_valid && valid_layers(codec.layers()) &&
-          (codec.video_layer_mode()==livekit::VideoLayer::MODE_UNUSED || codec.video_layer_mode()==livekit::VideoLayer::ONE_SPATIAL_LAYER_PER_STREAM);
+          (codec.video_layer_mode()==livekit::VideoLayer::MODE_UNUSED || codec.video_layer_mode()==livekit::VideoLayer::ONE_SPATIAL_LAYER_PER_STREAM ||
+           ((codec_name(codec.codec())=="vp9" || codec_name(codec.codec())=="av1") && codec.video_layer_mode()==livekit::VideoLayer::MULTIPLE_SPATIAL_LAYERS_PER_STREAM));
       bool allowed = p->claims.publish && (p->claims.publish_sources.empty() || std::find(p->claims.publish_sources.begin(), p->claims.publish_sources.end(), int(a.source())) != p->claims.publish_sources.end());
-      if (!allowed || !layers_valid || a.encryption() != livekit::Encryption::NONE || (a.type() != livekit::AUDIO && a.type() != livekit::VIDEO) || p->tracks.size() >= 16) {
+      if (!allowed || !layers_valid || (a.encryption()!=livekit::Encryption::NONE && a.encryption()!=livekit::Encryption::GCM && a.encryption()!=livekit::Encryption::CUSTOM) || (a.type() != livekit::AUDIO && a.type() != livekit::VIDEO) || (a.sid().empty() && p->tracks.size() >= 16)) {
         auto* error = res.mutable_request_response(); error->set_reason(livekit::RequestResponse::NOT_ALLOWED); error->set_message("Track permission, encryption or track limit rejected"); *error->mutable_add_track() = a; p->send(res); break;
       }
       name_limit(a.cid());
       auto* published = res.mutable_track_published(); published->set_cid(a.cid());
       for (const auto& [_, t] : p->tracks) if (t.cid == a.cid()) { *published->mutable_track() = t.info; p->send(res); return; }
+      if(!a.sid().empty()) {
+        auto existing=p->tracks.find(a.sid());
+        if(existing==p->tracks.end() || a.type()!=existing->second.info.type() || a.simulcast_codecs().empty())throw Error(400,"invalid_argument","Unknown backup publication");
+        auto& track=existing->second;
+        if(a.cid()==track.cid || a.type()!=livekit::VIDEO)throw Error(400,"invalid_argument","Invalid backup publication identity");
+        for(const auto& [other_sid,other]:p->tracks)if(other_sid!=a.sid() && (other.cid==a.cid() || other.variants.contains(a.cid())))throw Error(400,"invalid_argument","Backup CID already in use");
+        const auto& input=a.simulcast_codecs(0);auto name=codec_name(input.codec());
+        if(name!="vp8" && name!="vp9" && name!="av1" && name!="h264" && name!="h265")throw Error(400,"invalid_argument","Unsupported backup codec");
+        if(!track.variants.contains(a.cid()) && track.variants.size()>=2)throw Error(400,"invalid_argument","Too many backup codecs");
+        track.variants.try_emplace(a.cid());
+        livekit::SimulcastCodecInfo* codec=nullptr;
+        for(auto& candidate:*track.info.mutable_codecs())if(codec_name(candidate.mime_type())==name){codec=&candidate;break;}
+        if(!codec)codec=track.info.add_codecs();
+        codec->set_cid(a.cid());codec->set_mime_type("video/"+std::string(name=="vp8"?"VP8":name=="vp9"?"VP9":name=="av1"?"AV1":name=="h264"?"H264":"H265"));
+        codec->set_video_layer_mode(input.video_layer_mode()==livekit::VideoLayer::MODE_UNUSED ?
+          ((name=="vp9" || name=="av1")?livekit::VideoLayer::MULTIPLE_SPATIAL_LAYERS_PER_STREAM:livekit::VideoLayer::ONE_SPATIAL_LAYER_PER_STREAM):input.video_layer_mode());
+        *codec->mutable_layers()=input.layers().empty()?a.layers():input.layers();
+        normalize_codec_layers(*codec);
+        p->publisher->publication_codec(a.cid(),codec->mime_type(),track.info.encryption()!=livekit::Encryption::NONE);
+        *published->mutable_track()=track.info;p->send(res);updated(p);break;
+      }
       PublishedTrack track; track.cid = a.cid(); auto& t = track.info;
       t.set_sid(random_id("TR_")); t.set_name(a.name()); t.set_type(a.type()); t.set_source(a.source()); t.set_muted(a.muted());
       t.set_width(a.width()); t.set_height(a.height()); t.set_stream(a.stream()); t.set_encryption(a.encryption());
-      t.set_disable_red(true); *t.mutable_audio_features() = a.audio_features();
+      t.set_backup_codec_policy(a.backup_codec_policy());
+      t.set_disable_red(a.disable_red()); *t.mutable_audio_features() = a.audio_features();
+      t.set_stereo(a.stereo());t.set_disable_dtx(a.disable_dtx());
+      if(t.stream().empty())t.set_stream(a.source()==livekit::SCREEN_SHARE || a.source()==livekit::SCREEN_SHARE_AUDIO ? "screen" : "camera");
+      if(a.encryption()!=livekit::Encryption::NONE && config_.media_mode!="sfu")throw Error(400,"invalid_argument","Encrypted media requires SFU forwarding");
+      // Audio codec selection comes from SDP, but encryption must be recorded
+      // before that negotiation just as it is for video publications.
+      if(a.type()==livekit::AUDIO)p->publisher->publication_codec(a.cid(),"",a.encryption()!=livekit::Encryption::NONE);
       if (config_.media_mode=="sfu" && a.type()==livekit::VIDEO) {
         *t.mutable_layers()=a.layers();
         auto* codec=t.add_codecs(); codec->set_mime_type("video/VP8"); codec->set_cid(a.cid());
         *codec->mutable_layers()=a.layers();
-        for (const auto& input:a.simulcast_codecs()) if (codec_name(input.codec())=="vp8" || codec_name(input.codec())=="h264") {
-          codec->set_mime_type(codec_name(input.codec())=="h264" ? "video/H264" : "video/VP8");
-          codec->set_cid(input.cid());
+        for (const auto& input:a.simulcast_codecs()) if (codec_name(input.codec())=="vp8" || codec_name(input.codec())=="h264" || codec_name(input.codec())=="vp9" || codec_name(input.codec())=="av1" || codec_name(input.codec())=="h265") {
+          codec->set_mime_type(codec_name(input.codec())=="h264" ? "video/H264" : codec_name(input.codec())=="vp9" ? "video/VP9" : codec_name(input.codec())=="av1" ? "video/AV1" : codec_name(input.codec())=="h265" ? "video/H265" : "video/VP8");
+          codec->set_cid(input.cid().empty()?a.cid():input.cid());
+          codec->set_video_layer_mode(input.video_layer_mode());
           if (!input.layers().empty()) { *codec->mutable_layers()=input.layers(); *t.mutable_layers()=input.layers(); }
           break;
         }
-        codec->set_video_layer_mode(livekit::VideoLayer::ONE_SPATIAL_LAYER_PER_STREAM);
-        t.set_simulcast(codec->layers_size()>1);
-        p->publisher->publication_codec(a.cid(),codec->mime_type());
+        if (codec->video_layer_mode()==livekit::VideoLayer::MODE_UNUSED)
+          codec->set_video_layer_mode((codec_name(codec->mime_type())=="vp9" || codec_name(codec->mime_type())=="av1") ?
+            livekit::VideoLayer::MULTIPLE_SPATIAL_LAYERS_PER_STREAM : livekit::VideoLayer::ONE_SPATIAL_LAYER_PER_STREAM);
+        const bool svc=codec->video_layer_mode()==livekit::VideoLayer::MULTIPLE_SPATIAL_LAYERS_PER_STREAM;
+        if (svc) {
+          // Older SDKs omit video_layer_mode for VP9. Go infers SVC and
+          // publishes ordered spatial indices, not three simulcast streams.
+          auto* layers=codec->mutable_layers();
+          std::sort(layers->begin(),layers->end(),[](const auto& a,const auto& b) {
+            return uint64_t(a.width())*a.height()<uint64_t(b.width())*b.height();
+          });
+          for (int i=0;i<layers->size();++i) layers->Mutable(i)->set_spatial_layer(i);
+          *t.mutable_layers()=*layers;
+        }
+        t.set_simulcast(!svc && codec->layers_size()>1);
+        p->publisher->publication_codec(a.cid(),codec->mime_type(),a.encryption()!=livekit::Encryption::NONE);
+        const auto primary_mime=codec->mime_type();
+        for(const auto& backup:a.simulcast_codecs()) {
+          auto name=codec_name(backup.codec());if(name==codec_name(primary_mime))continue;
+          if(name!="vp8" && name!="vp9" && name!="av1" && name!="h264" && name!="h265")continue;
+          auto* extra=t.add_codecs();extra->set_cid(backup.cid());
+          extra->set_mime_type("video/"+std::string(name=="vp8"?"VP8":name=="vp9"?"VP9":name=="av1"?"AV1":name=="h264"?"H264":"H265"));
+          extra->set_video_layer_mode(backup.video_layer_mode()==livekit::VideoLayer::MODE_UNUSED?((name=="vp9" || name=="av1")?livekit::VideoLayer::MULTIPLE_SPATIAL_LAYERS_PER_STREAM:livekit::VideoLayer::ONE_SPATIAL_LAYER_PER_STREAM):backup.video_layer_mode());
+          *extra->mutable_layers()=backup.layers().empty()?a.layers():backup.layers();
+          normalize_codec_layers(*extra);
+          if(!backup.cid().empty()){track.variants.try_emplace(backup.cid());p->publisher->publication_codec(backup.cid(),extra->mime_type(),a.encryption()!=livekit::Encryption::NONE);}
+        }
       }
       *published->mutable_track() = t; p->tracks[t.sid()] = std::move(track); p->send(res); updated(p); break;
     }
@@ -459,16 +571,12 @@ void Rooms::signal(const std::shared_ptr<Participant>& p, const livekit::SignalR
       if (req.track_setting().width()>16384 || req.track_setting().height()>16384 ||
           req.track_setting().quality()<livekit::LOW || req.track_setting().quality()>livekit::OFF)
         throw Error(400,"invalid_argument","Invalid video subscription dimensions or quality");
-      if (req.track_setting().fps()) {
-        res.mutable_request_response()->set_reason(livekit::RequestResponse::UNSUPPORTED_TYPE);
-        res.mutable_request_response()->set_message("Per-subscription fps is not implemented"); p->send(res); break;
-      }
       for (const auto& sid : req.track_setting().track_sids()) {
         bool exists=false;
         for (const auto& [_,publisher]:room(p->claims.room).participants)
           if (publisher!=p && publisher->tracks.contains(sid)) { exists=true; break; }
         if (!exists) continue;
-        VideoSubscription settings{std::min(2,int(req.track_setting().quality())),req.track_setting().width(),req.track_setting().height(),req.track_setting().priority()};
+        VideoSubscription settings{std::min(2,int(req.track_setting().quality())),req.track_setting().width(),req.track_setting().height(),req.track_setting().priority(),req.track_setting().fps()};
         p->track_settings[sid]=settings; p->subscriber->track_settings(sid,settings);
         if (req.track_setting().disabled() || req.track_setting().quality()==livekit::OFF) { p->disabled_tracks.insert(sid); p->subscriber->enable_track(sid, false); }
         else { p->disabled_tracks.erase(sid); if (p->subscriptions.contains(sid) && p->subscriptions[sid]) subscribe(p, sid, true); }
@@ -482,12 +590,12 @@ void Rooms::signal(const std::shared_ptr<Participant>& p, const livekit::SignalR
       // Invalid self-updates are recoverable signaling requests, not transport
       // failures. Validate every field before applying any claims or metadata.
       std::string limit_error;
-      if (req.update_metadata().name().size() > 256) limit_error = "exceeds name length limit";
-      else if (req.update_metadata().metadata().size() > 512 * 1024) limit_error = "exceeds metadata size limit";
+      if (Limits::exceeded(req.update_metadata().name().size(), config_.limits.max_participant_name_length)) limit_error = "exceeds name length limit";
+      else if (Limits::exceeded(req.update_metadata().metadata().size(), config_.limits.max_metadata_size)) limit_error = "exceeds metadata size limit";
       else {
         size_t bytes = 0;
         for (const auto& [key, value] : req.update_metadata().attributes()) bytes += key.size() + value.size();
-        if (bytes > 65536) limit_error = "exceeds attributes size limit";
+        if (Limits::exceeded(bytes, config_.limits.max_attributes_size)) limit_error = "exceeds attributes size limit";
       }
       if (!limit_error.empty()) {
         response->set_reason(livekit::RequestResponse::LIMIT_EXCEEDED);
@@ -518,9 +626,36 @@ void Rooms::signal(const std::shared_ptr<Participant>& p, const livekit::SignalR
     }
     case livekit::SignalRequest::kSubscriptionPermission:
       update_subscription_permissions(p, req.subscription_permission()); break;
-    case livekit::SignalRequest::kUpdateLayers:
+    case livekit::SignalRequest::kUpdateLayers: break; // Deprecated; ignored by the pinned Go signal handler.
     case livekit::SignalRequest::kUpdateAudioTrack:
-    case livekit::SignalRequest::kUpdateVideoTrack: break;
+    case livekit::SignalRequest::kUpdateVideoTrack: {
+      const bool audio = req.has_update_audio_track();
+      const auto& sid = audio ? req.update_audio_track().track_sid() : req.update_video_track().track_sid();
+      auto it = p->tracks.find(sid);
+      if (it == p->tracks.end()) {
+        auto* error = res.mutable_request_response(); error->set_reason(livekit::RequestResponse::NOT_FOUND);
+        if (audio) *error->mutable_update_audio_track() = req.update_audio_track();
+        else *error->mutable_update_video_track() = req.update_video_track();
+        p->send(res); break;
+      }
+      auto& track = it->second;
+      // Go accepts updates while publication is pending, then exposes them
+      // when media arrives. Published tracks ignore fields of the wrong kind.
+      if (audio && (!track.media || track.info.type() == livekit::AUDIO)) {
+        const auto& features = req.update_audio_track().features();
+        const std::set<int> unique(features.begin(), features.end());
+        track.info.clear_audio_features();
+        for (int feature : unique) track.info.add_audio_features(static_cast<livekit::AudioTrackFeature>(feature));
+        track.info.set_stereo(unique.contains(livekit::TF_STEREO));
+        track.info.set_disable_dtx(unique.contains(livekit::TF_NO_DTX));
+      } else if (!audio && (!track.media || track.info.type() == livekit::VIDEO)) {
+        track.info.set_width(req.update_video_track().width());
+        track.info.set_height(req.update_video_track().height());
+      }
+      if (track.media) updated(p);
+      // These operations have no success acknowledgement, even in protocol 15+.
+      break;
+    }
     default:
       res.mutable_request_response()->set_reason(livekit::RequestResponse::UNSUPPORTED_TYPE);
       res.mutable_request_response()->set_message("Signal operation is not implemented"); p->send(res); break;
@@ -544,10 +679,10 @@ Json Rooms::api(const std::string& method, const Json& json, const Claims& claim
   // looking up room/participant state. Rejected updates must have no effects.
   if (method == "UpdateParticipant") {
     auto req = from_json<livekit::UpdateParticipantRequest>(json);
-    api_limit(req.name().size(), 256, "name length exceeds limits");
-    metadata_limit(req.metadata()); attributes_limit(req.attributes());
+    api_limit(req.name().size(), config_.limits.max_participant_name_length, "name length exceeds limits");
+    metadata_limit(req.metadata(), config_.limits); attributes_limit(req.attributes(), config_.limits);
   } else if (method == "UpdateRoomMetadata") {
-    metadata_limit(from_json<livekit::UpdateRoomMetadataRequest>(json).metadata());
+    metadata_limit(from_json<livekit::UpdateRoomMetadataRequest>(json).metadata(), config_.limits);
   }
   auto name = json.value("room", ""); require_api(claims.admin && claims.room == name);
   if (method == "ListParticipants") {
@@ -757,10 +892,132 @@ Json Rooms::metrics() const {
   result["rpc_pending"] = api_rpcs_.size();
   return result;
 }
+void Rooms::media_tick() {
+  if(config_.media_mode!="sfu")return;
+  std::set<const webrtc::MediaStreamTrackInterface*> muted;
+  for(const auto& [_,room]:rooms_)for(const auto& [__,p]:room.participants)for(const auto& [sid,track]:p->tracks)if(track.info.muted()){
+    if(track.media)muted.insert(track.media.get());
+    for(const auto& [cid,variant]:track.variants)if(variant.media)muted.insert(variant.media.get());
+  }
+  const auto sources=rtc_.sfu->source_states(muted);
+  const bool send_quality=now_ms()>=next_quality_update_;
+  if(send_quality)next_quality_update_=now_ms()+5000;
+  for(auto& [_,room]:rooms_) {
+    std::map<std::string,double> levels;
+    std::map<std::string,std::pair<int,float>> qualities;
+    std::map<std::string,std::map<std::string,MediaSubscriptionState>> subscriptions;
+    for(const auto& [identity,p]:room.participants)if(!p->closed)subscriptions[identity]=p->subscriber->media_states();
+    for(auto& [identity,p]:room.participants) {
+      if(p->closed)continue;
+      double score=100;
+      for(const auto& [sid,state]:subscriptions[identity])score=std::min(score,state.quality_score);
+      for(const auto& [sid,track]:p->tracks)if(track.media && !track.info.muted()){
+        if(auto source=sources.find(track.media.get());source!=sources.end())score=std::min(score,source->second.quality_score);
+      }
+      if(!p->ice_connected)score=20;
+      int quality=score>80?livekit::EXCELLENT:score>40?livekit::GOOD:score>20?livekit::POOR:livekit::LOST;
+      qualities[p->info.sid()]={quality,MediaQuality::mos(score)};
+      bool metadata_changed=false;
+      for(auto& [sid,track]:p->tracks) {
+        auto source=track.media?sources.find(track.media.get()):sources.end();
+        if(track.info.type()==livekit::AUDIO && !track.info.muted() && source!=sources.end())
+          levels[p->info.sid()]=std::max(levels[p->info.sid()],source->second.audio_level);
+        if(track.info.type()!=livekit::VIDEO)continue;
+        int maximum=-1;
+        std::map<std::string,int> codec_maxima;
+        for(const auto& codec:track.info.codecs())codec_maxima[codec_name(codec.mime_type())]=-1;
+        for(const auto& [other_id,other]:room.participants) {
+          if(other==p || other->closed || !other->claims.subscribe || other->disabled_tracks.contains(sid))continue;
+          bool wanted=other->subscriptions.contains(sid)?other->subscriptions.at(sid):other->auto_subscribe;
+          if(!wanted || (!other->claims.is_recorder() && !p->subscription_permissions.allows(other->claims.identity,sid)))continue;
+          auto settings=other->track_settings.contains(sid)?other->track_settings.at(sid):VideoSubscription{};
+          std::vector<VideoLayerChoice> choices;
+          for(const auto& layer:track.info.layers())choices.push_back({uint32_t(layer.quality()+1),layer.width(),layer.height(),int(layer.quality())});
+          auto selected=select_video_layer(choices,settings);
+          int requested=selected?int(selected)-1:settings.quality;
+          maximum=std::max(maximum,requested);
+          auto state=subscriptions[other_id].find(sid);
+          auto codec=state!=subscriptions[other_id].end() && !state->second.codec.empty() ? state->second.codec : codec_name(track.info.mime_type());
+          if(codec_maxima.contains(codec))codec_maxima[codec]=std::max(codec_maxima[codec],requested);
+        }
+        bool regress=false;
+        if(track.info.backup_codec_policy()!=livekit::SIMULCAST){
+          if(track.regressed_codec.empty())for(const auto& [codec,quality]:codec_maxima)if(quality>=0 && codec!=codec_name(track.info.mime_type())){track.regressed_codec=codec;regress=true;break;}
+          if(!track.regressed_codec.empty())for(auto& [codec,quality]:codec_maxima)quality=codec==track.regressed_codec?maximum:-1;
+        }
+        if(regress)for(const auto& [_,other]:room.participants)if(other!=p && other->claims.subscribe && (other->subscriptions.contains(sid)?other->subscriptions.at(sid):other->auto_subscribe))subscribe(other,sid,true);
+        if(track.last_subscribed_quality!=maximum || track.last_codec_qualities!=codec_maxima) {
+          livekit::SignalResponse response;auto* update=response.mutable_subscribed_quality_update();update->set_track_sid(sid);
+          for(const auto& codec:track.info.codecs()) {
+            auto* subscribed=update->add_subscribed_codecs();subscribed->set_codec(codec_name(codec.mime_type()));
+            for(int q=0;q<3;++q){auto* quality=subscribed->add_qualities();quality->set_quality(livekit::VideoQuality(q));quality->set_enabled(q<=codec_maxima[codec_name(codec.mime_type())]);}
+          }
+          for(int q=0;q<3;++q){auto* quality=update->add_subscribed_qualities();quality->set_quality(livekit::VideoQuality(q));quality->set_enabled(q<=maximum);}
+          p->send(response);track.last_subscribed_quality=maximum;track.last_codec_qualities=codec_maxima;
+        }
+        {
+          for(auto& codec:*track.info.mutable_codecs()) {
+            auto codec_source=source;
+            if(!codec.cid().empty() && codec.cid()!=track.cid){
+              auto variant=track.variants.find(codec.cid());
+              codec_source=variant!=track.variants.end() && variant->second.media ? sources.find(variant->second.media.get()):sources.end();
+            }
+            if(codec_source==sources.end())continue;
+            for(auto& layer:*codec.mutable_layers())for(const auto& actual:codec_source->second.layers) {
+              bool match=codec.video_layer_mode()==livekit::VideoLayer::MULTIPLE_SPATIAL_LAYERS_PER_STREAM || int(layer.quality())==actual.quality;
+              if(match && layer.ssrc()!=actual.ssrc){layer.set_ssrc(actual.ssrc);metadata_changed=true;}
+            }
+          }
+          if(track.info.codecs_size())*track.info.mutable_layers()=track.info.codecs(0).layers();
+        }
+      }
+      if(metadata_changed)updated(p);
+    }
+    for(auto& [identity,p]:room.participants) {
+      if(p->closed || p->info.state()!=livekit::ParticipantInfo::ACTIVE)continue;
+      livekit::SignalResponse speakers,streams,quality_update;
+      std::map<std::string,double> audible;
+      std::map<std::string,int> visible_qualities;
+      for(const auto& [publisher_id,publisher]:room.participants) {
+        if(publisher->claims.hidden && publisher!=p)continue;
+        bool scoped=publisher==p;
+        for(const auto& [sid,track]:publisher->tracks)if(subscriptions[identity].contains(sid))scoped=true;
+        auto level=levels[publisher->info.sid()];
+        if(scoped && level>0)audible[publisher->info.sid()]=std::ceil(std::min(1.0,level)*8)/8;
+        if(send_quality && scoped && publisher->info.state()==livekit::ParticipantInfo::ACTIVE) {
+          auto [quality,score]=qualities[publisher->info.sid()];
+          if(quality==livekit::LOST && p->client_info.protocol()<=10)quality=livekit::POOR;
+          visible_qualities[publisher->info.sid()]=quality;
+          auto* info=quality_update.mutable_connection_quality()->add_updates();info->set_participant_sid(publisher->info.sid());info->set_quality(livekit::ConnectionQuality(quality));info->set_score(score);
+        }
+        for(const auto& [sid,track]:publisher->tracks) {
+          auto state=subscriptions[identity].find(sid);if(state==subscriptions[identity].end())continue;
+          if(!p->stream_states.contains(sid) || p->stream_states[sid]!=state->second.active) {
+            auto* info=streams.mutable_stream_state_update()->add_stream_states();info->set_participant_sid(publisher->info.sid());info->set_track_sid(sid);info->set_state(state->second.active?livekit::ACTIVE:livekit::PAUSED);
+            p->stream_states[sid]=state->second.active;
+          }
+        }
+      }
+      for(const auto& [sid,level]:p->speaker_levels)if(!audible.contains(sid)){
+        auto* speaker=speakers.mutable_speakers_changed()->add_speakers();speaker->set_sid(sid);speaker->set_active(false);speaker->set_level(0);
+      }
+      for(const auto& [sid,level]:audible)if(p->replay_speakers || !p->speaker_levels.contains(sid) || p->speaker_levels[sid]!=level){
+        auto* speaker=speakers.mutable_speakers_changed()->add_speakers();speaker->set_sid(sid);speaker->set_active(true);speaker->set_level(float(level));
+      }
+      p->speaker_levels=std::move(audible);
+      p->replay_speakers=false;
+      for(auto it=p->stream_states.begin();it!=p->stream_states.end();)if(!subscriptions[identity].contains(it->first))it=p->stream_states.erase(it);else ++it;
+      if(speakers.has_speakers_changed())p->send(speakers);
+      if(streams.has_stream_state_update())p->send(streams);
+      if(quality_update.has_connection_quality() && visible_qualities!=p->connection_qualities){p->send(quality_update);p->connection_qualities=std::move(visible_qualities);}
+    }
+  }
+}
 void Rooms::tick() {
-  timer_.expires_after(std::chrono::seconds(1));
+  timer_.expires_after(std::chrono::milliseconds(200));
   timer_.async_wait([this](boost::system::error_code error) {
     if (error || stopping_) return;
+    media_tick();
     std::vector<std::shared_ptr<Participant>> expired;
     for (const auto& [_, r] : rooms_) for (const auto& [__, p] : r.participants) if (now_ms() - p->last_seen > 30000) expired.push_back(p);
     for (auto& p : expired) {

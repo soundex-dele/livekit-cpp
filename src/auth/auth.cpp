@@ -47,7 +47,9 @@ std::string Auth::sign(const Json& claims, const std::string& secret) {
 }
 Claims Auth::verify(const std::string& token, int64_t now) const {
   try {
-    if (token.size() > 32768) throw std::runtime_error("Token too large");
+    // Match the HTTP header envelope; the old 32 KiB cap rejected otherwise
+    // valid JWT metadata well below Go's default 512 KiB metadata limit.
+    if (token.size() > 1024 * 1024) throw std::runtime_error("Token too large");
     auto a = token.find('.'), b = token.find('.', a == std::string::npos ? 0 : a + 1);
     if (a == std::string::npos || b == std::string::npos || token.find('.', b + 1) != std::string::npos) throw std::runtime_error("Invalid token");
     auto header = Json::parse(decode(token.substr(0, a)));

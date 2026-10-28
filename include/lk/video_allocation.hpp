@@ -39,7 +39,7 @@ inline int64_t recovery_padding_demand(int64_t target_bps,int64_t admitted_bps,i
   return admitted_bps>=std::max<int64_t>(0,target_bps)*60/100 ? requested_bps : 0;
 }
 inline MediaAllocation allocate_video_bandwidth(int64_t target_bps,int64_t audio_demand_bps,
-    int64_t now_ms,std::vector<VideoBandwidthRequest>& requests) {
+    int64_t now_ms,std::vector<VideoBandwidthRequest>& requests,bool allow_pause=true) {
   MediaAllocation result;
   // Keep 15% for retransmission/control traffic. Audio takes precedence even
   // when its demand exceeds the target; no video is then admitted.
@@ -62,8 +62,8 @@ inline MediaAllocation allocate_video_bandwidth(int64_t target_bps,int64_t audio
   auto distribute=[&](int64_t remaining) {
     std::vector<int> chosen(requests.size(),-1);
     // Admit base layers before upgrading any video; priority resolves shortage.
-    for (auto i:order) if (!requests[i].layers.empty() && requests[i].layers[0].bps<=remaining) {
-      chosen[i]=0; remaining-=requests[i].layers[0].bps;
+    for (auto i:order) if (!requests[i].layers.empty() && (!allow_pause || requests[i].layers[0].bps<=remaining)) {
+      chosen[i]=0; remaining=std::max<int64_t>(0,remaining-requests[i].layers[0].bps);
     }
     for (auto i:order) if (chosen[i]>=0) {
       const auto& layers=requests[i].layers;
@@ -104,6 +104,10 @@ inline MediaAllocation allocate_video_bandwidth(int64_t target_bps,int64_t audio
     // Waiting for source discovery or the first affordable base layer is not
     // a congestion pause. Start that base layer immediately when it first fits;
     // hysteresis applies to upgrades and to resuming previously allocated video.
+    // Go defaults allow_pause to false: an available base layer stays active
+    // even if its estimated cost exceeds the target. Pacing remains native;
+    // bandwidth shortage must not turn this policy into a permanent mute.
+    if(!allow_pause && selected<0 && !request.layers.empty()){selected=0;state.pending=0;}
     state.initialized|=selected>=0;
     state.selected=selected>=0 ? request.layers[size_t(selected)].ssrc : 0;
     if (selected>=0) result.video_allocated_bps+=request.layers[size_t(selected)].bps;

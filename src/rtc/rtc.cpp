@@ -9,6 +9,7 @@
 #include <api/audio/audio_device.h>
 #include <api/create_peerconnection_factory.h>
 #include <api/enable_media.h>
+#include <api/field_trials.h>
 #include <api/audio_codecs/builtin_audio_decoder_factory.h>
 #include <api/audio_codecs/builtin_audio_encoder_factory.h>
 #include <api/video_codecs/builtin_video_decoder_factory.h>
@@ -70,6 +71,7 @@ RtcRuntime::RtcRuntime(bool packet_forwarding) {
 #else
   deps.task_queue_factory = webrtc::CreateDefaultTaskQueueFactory();
 #endif
+  if(packet_forwarding)deps.trials=webrtc::FieldTrials::CreateNoGlobal("WebRTC-DependencyDescriptorAdvertised/Enabled/WebRTC-GenericDescriptorAdvertised/Enabled/");
   deps.sctp_factory = std::make_unique<NativeSctpFactory>(network_.get());
   deps.adm = webrtc::make_ref_counted<HeadlessAudioDevice>();
   deps.audio_encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
@@ -209,7 +211,7 @@ void Peer::create_description(bool offer, uint32_t id) {
       std::vector<webrtc::RtpCodecCapability> codecs;
       auto source=sender_codecs_.find(transceiver->sender()->id());
       std::optional<webrtc::RtpCodecParameters> selected;
-      if (source!=sender_codecs_.end()) selected=source->second;
+      if (source!=sender_codecs_.end() && !source->second.empty()) selected=source->second.front();
       else if (!offer && pc_->remote_description() && transceiver->mid()) {
         const auto* content=pc_->remote_description()->description()->GetContentByName(*transceiver->mid());
         auto requested=publication_codecs_.find(transceiver->receiver()->track()->id());
@@ -224,8 +226,24 @@ void Peer::create_description(bool offer, uint32_t id) {
         }
       }
       for (const auto& codec : capabilities.codecs)
-        if (codec_name(codec.name)=="rtx" || (forwarding_codec(codec) &&
-            (!selected || same_forwarding_codec(codec,*selected)))) codecs.push_back(codec);
+        if (codec_name(codec.name)=="rtx" || (codec_name(codec.name)=="red" && transceiver->media_type()==webrtc::MediaType::AUDIO && (!selected || codec_name(selected->name)=="opus")) || (forwarding_codec(codec) &&
+            (source!=sender_codecs_.end() ? std::any_of(source->second.begin(),source->second.end(),[&](const auto& choice){return same_forwarding_codec(codec,choice);}) : (!selected || same_forwarding_codec(codec,*selected))))) codecs.push_back(codec);
+      if(source!=sender_codecs_.end()) {
+        auto rank=[&](const auto& codec){for(size_t i=0;i<source->second.size();++i)if(same_forwarding_codec(codec,source->second[i]))return i;return source->second.size();};
+        std::stable_sort(codecs.begin(),codecs.end(),[&](const auto& a,const auto& b){return rank(a)<rank(b);});
+      } else if(!offer && transceiver->media_type()==webrtc::MediaType::AUDIO && pc_->remote_description() && transceiver->mid()) {
+        const auto* content=pc_->remote_description()->description()->GetContentByName(*transceiver->mid());
+        if(content && content->media_description()){
+          // Preserve the publisher's RED/Opus preference. Selecting Opus as
+          // the inner codec must not silently move it ahead of offered RED.
+          const auto& offered=content->media_description()->codecs();
+          auto rank=[&](const auto& codec){
+            for(size_t i=0;i<offered.size();++i)if(codec_name(codec.name)==codec_name(offered[i].name) && codec.clock_rate==offered[i].clockrate)return i;
+            return offered.size();
+          };
+          std::stable_sort(codecs.begin(),codecs.end(),[&](const auto& a,const auto& b){return rank(a)<rank(b);});
+        }
+      }
       auto result = transceiver->SetCodecPreferences(codecs);
       if (!result.ok()) { fail(std::string(result.message())); return; }
     }
@@ -313,8 +331,22 @@ void Peer::ice_candidate(const std::string& json) {
   std::unique_ptr<webrtc::IceCandidateInterface> c(webrtc::CreateIceCandidate(j.value("sdpMid", ""), j.value("sdpMLineIndex", 0), j.at("candidate").get<std::string>(), &error));
   if (!c || !pc_->AddIceCandidate(c.get())) throw Error(400, "invalid_argument", "Invalid ICE candidate");
 }
-void Peer::add_track(const std::string& sid, const std::string& participant_sid, Track remote, const std::optional<webrtc::RtpCodecParameters>& codec) {
-  if (closed_ || senders_.contains(sid)) return;
+void Peer::add_track(const std::string& sid, const std::string& participant_sid, Track remote, const std::optional<webrtc::RtpCodecParameters>& codec,const std::vector<TrackVariant>& variants) {
+  if (closed_) return;
+  std::vector<Track> variant_tracks;
+  std::vector<webrtc::RtpCodecParameters> codecs;
+  if(codec)codecs.push_back(*codec);
+  for(const auto& variant:variants){if(variant.track)variant_tracks.push_back(variant.track);if(variant.codec)codecs.push_back(*variant.codec);}
+  if(senders_.contains(sid)) {
+    if(sfu_){
+      auto& current=sender_codecs_[senders_[sid]->id()];
+      bool changed=current!=codecs;current=codecs;
+      sfu_->add(sid,senders_[sid]->id(),remote,variant_tracks);
+      sfu_->refresh(pc_);
+      if(changed){dirty_=true;negotiate();}
+    }
+    return;
+  }
   Track local;
   if (remote->kind() == "audio") {
     auto track = static_cast<webrtc::AudioTrackInterface*>(remote.get());
@@ -372,8 +404,8 @@ void Peer::add_track(const std::string& sid, const std::string& participant_sid,
     if (!result.ok()) { fail(std::string(result.error().message())); return; }
     senders_[sid] = result.MoveValue();
   }
-  if (sfu_ && codec) sender_codecs_[senders_[sid]->id()]=*codec;
-  if (sfu_) sfu_->add(sid, senders_[sid]->id(), remote);
+  if (sfu_ && codec) sender_codecs_[senders_[sid]->id()]=std::move(codecs);
+  if (sfu_) sfu_->add(sid, senders_[sid]->id(), remote,variant_tracks);
   dirty_ = true; negotiate();
 }
 void Peer::remove_track(const std::string& sid) {
@@ -445,7 +477,9 @@ void Peer::OnTrack(webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> t) {
     if (auto p=weak.lock();p && !p->closed_) p->pending_tracks_.push_back(t);
   });
 }
-void Peer::publication_codec(const std::string& cid,const std::string& codec) {
+std::map<std::string,MediaSubscriptionState> Peer::media_states() const {return sfu_ ? sfu_->states() : std::map<std::string,MediaSubscriptionState>{};}
+void Peer::publication_codec(const std::string& cid,const std::string& codec,std::optional<bool> encrypted) {
+  if(sfu_)sfu_->publication(cid,encrypted);
   if (codec.empty()) publication_codecs_.erase(cid);
   else publication_codecs_[cid]=codec_name(codec);
 }

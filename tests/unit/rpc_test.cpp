@@ -19,12 +19,12 @@ int main() {
     livekit::DataPacket sent;
     auto send = [&](const livekit::DataPacket& packet) { sent = packet; return true; };
     auto done = [&](lk::RpcRequests::Result result) { results.push_back(std::move(result)); };
-    auto pump = [&](int ms) {
-      io.restart(); io.run_for(std::chrono::milliseconds(ms));
-      // A descheduled test thread can reach run_for's deadline before Asio
-      // dispatches an already due timer. Drain ready handlers without extending
-      // the wait or changing the request's ACK/response deadlines.
-      io.restart(); io.poll();
+    auto pump = [&] {
+      // Every scenario completes or cancels all requests. Drain the actual
+      // asynchronous timers (including IOCP cancellation completions) instead
+      // of assuming a short run_for budget has dispatched an expired timer.
+      // CTest supplies the outer hang timeout; ACK/response deadlines are unchanged.
+      io.restart(); io.run();
     };
     auto cancel = rpc.start("PA_target", "echo", "hello", 100, 10, send, done);
     check(sent.rpc_request().id().size() == 36 && sent.participant_identity() == sent.rpc_request().id(), "Server RPC identity contract mismatch");
@@ -36,18 +36,18 @@ int main() {
     check(rpc.receive("PA_target", response) && rpc.size() == 0, "Response before ACK did not complete");
     check(std::get<std::string>(results.back()).empty(), "Empty response payload lost oneof presence");
     check(!rpc.receive("PA_target", response), "Duplicate response completed twice");
-    cancel(); pump(120);
+    cancel(); pump();
     check(results.size() == 1, "Completed RPC still fired a timer");
 
     rpc.start("PA_target", "slow", "", 100, 0, send, done);
-    pump(60);
+    pump();
     check_error(results.back(), 408, "canceled", "RpcError 1501: Connection timeout");
     check(rpc.size() == 0, "ACK timeout retained request");
     rpc.start("PA_target", "slow", "", 55, 0, send, done);
     livekit::DataPacket ack; ack.mutable_rpc_ack()->set_request_id(sent.rpc_request().id());
     check(!rpc.receive("PA_attacker", ack), "Another participant forged an ACK");
     check(rpc.receive("PA_target", ack), "ACK not matched");
-    pump(75);
+    pump();
     check_error(results.back(), 408, "canceled", "RpcError 1502: Response timeout");
 
     auto first = rpc.start("PA_old", "echo", "", 0, 0, send, done);
@@ -56,7 +56,7 @@ int main() {
     check(rpc.size() == 1, "Participant departure canceled another session");
     check_error(results.back(), 503, "unavailable", "RpcError 1503: Recipient disconnected");
     const auto count = results.size();
-    first(); second(); pump(100);
+    first(); second(); pump();
     check(results.size() == count && rpc.size() == 0, "Cancellation delivered a result or leaked state");
 
     rpc.start("PA_target", "error", "", 0, 0, send, done);
@@ -75,20 +75,20 @@ int main() {
     check(rejected && rpc.size() == 0, "Send failure retained timers or request");
     cancel = rpc.start("PA_target", "boundary", std::string(15360, 'x'), 20, 30, send, done);
     check(sent.rpc_request().response_timeout_ms() == uint32_t(20u - 30u), "RTT field differs from Go uint32 wire contract");
-    pump(80);
+    pump();
     check_error(results.back(), 408, "canceled", "RpcError 1502: Response timeout");
     check(rpc.size() == 0, "Wrapped client timeout extended the server deadline");
     cancel = rpc.start("PA_target", "shutdown", "", 0, 0, send, done);
     rpc.shutdown();
     check_error(results.back(), 503, "unavailable", "RpcError 1503: Recipient disconnected");
-    cancel(); pump(100);
+    cancel(); pump();
     check(rpc.size() == 0, "Shutdown retained requests");
     lk::RpcRequests::Cancel late;
     {
       lk::RpcRequests temporary(io);
       late = temporary.start("PA_target", "destroy", "", 0, 0, send, done);
     }
-    late(); pump(10);
+    late(); pump();
     std::cout << "PASS: RPC success, sender binding, ACK/response deadlines, cancellation, disconnect and destruction\n";
   } catch (const std::exception& error) { std::cerr << "FAIL: " << error.what() << '\n'; return 1; }
 }

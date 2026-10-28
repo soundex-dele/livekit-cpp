@@ -1,4 +1,5 @@
 #pragma once
+#include "lk/media_quality.hpp"
 #include <api/environment/environment.h>
 #include <api/rtp_parameters.h>
 #include <modules/rtp_rtcp/source/rtp_packet_received.h>
@@ -66,7 +67,8 @@ class NativeReceiveTransport {
 struct NativeSendConfig {
   uint32_t ssrc=0;
   std::optional<uint32_t> rtx_ssrc;
-  int payload_type=96,rtx_payload_type=-1;
+  int payload_type=96,rtx_payload_type=-1,red_payload_type=-1;
+  int h264_packetization_mode=1;
   bool audio=false,extmap_allow_mixed=false;
   webrtc::VideoCodecType video_codec=webrtc::kVideoCodecVP8;
   std::string mid;
@@ -75,29 +77,40 @@ struct NativeSendConfig {
 };
 class NativeRtpSender {
  public:
+  struct Continuity {
+    uint32_t ssrc=0,packets=0,octets=0;
+    std::optional<uint32_t> rtx_ssrc,timestamp;
+    uint16_t sequence=0,rtx_sequence=0;
+    webrtc::Timestamp at=webrtc::Timestamp::MinusInfinity();
+  };
+  struct Quality : MediaQualitySample { double loss=0; bool has_feedback=false; };
   using Send = std::function<bool(const webrtc::RtpPacketToSend&)>;
   NativeRtpSender(const webrtc::Environment&,NativeSendConfig,Send,std::function<void()> keyframe,
                  std::shared_ptr<NativeSendTransport> transport = {});
   ~NativeRtpSender();
-  void forward(const webrtc::RtpPacketReceived&);
+  void forward(const webrtc::RtpPacketReceived&,int source_red_pt=-1,int source_primary_pt=-1,bool encrypted=false);
   // Repacketize an already encoded frame with its native codec packetizer.
   // Each subscriber owns picture IDs, RTP sequence and source clock mapping.
-  bool forward_frame(const webrtc::EncodedFrame&,uint32_t source_ssrc);
+  bool forward_frame(const webrtc::EncodedFrame&,uint32_t source_ssrc,int max_spatial_layer=7,int max_temporal_layer=7);
   void feedback(webrtc::ArrayView<const uint8_t>);
   void set_enabled(bool);
   // Budget pause clears media/RTX while keeping native padding probes alive.
   void set_media_paused(bool);
+  Quality quality() const;
+  Continuity continuity() const;
+  void restore_continuity(const Continuity&);
   webrtc::rtcp::SenderReport translate_report(const webrtc::rtcp::SenderReport&) const;
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
 // Native depacketization, complete-frame assembly and dependency discovery.
+const webrtc::RTPVideoHeaderVP9* native_vp9_header(const webrtc::EncodedFrame&);
 // Does not create a decoder. Include RTP padding so native gap tracking works.
 class NativeVideoAssembler {
  public:
   using Frame = std::function<void(const webrtc::EncodedFrame&)>;
-  explicit NativeVideoAssembler(Frame,webrtc::VideoCodecType codec=webrtc::kVideoCodecVP8);
+  explicit NativeVideoAssembler(Frame,webrtc::VideoCodecType codec=webrtc::kVideoCodecVP8,bool opaque=false);
   ~NativeVideoAssembler();
   void receive(const webrtc::RtpPacketReceived&);
  private:
@@ -106,9 +119,10 @@ class NativeVideoAssembler {
 };
 struct NativeReceiveConfig {
   uint32_t ssrc=0;
-  int payload_type=96,rtx_payload_type=-1;
+  int payload_type=96,rtx_payload_type=-1,red_payload_type=-1;
+  int h264_packetization_mode=1;
   int clock_rate_hz=90000;
-  bool audio=false;
+  bool audio=false,encrypted=false;
   webrtc::VideoCodecType video_codec=webrtc::kVideoCodecVP8;
   std::vector<webrtc::RtpExtension> extensions;
   bool operator==(const NativeReceiveConfig&) const = default;
@@ -122,6 +136,7 @@ class NativeRtpReceiver {
   void receive(const webrtc::RtpPacketReceived&);
   void feedback(webrtc::ArrayView<const uint8_t>);
   void request_keyframe();
+  MediaQualitySample quality() const;
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

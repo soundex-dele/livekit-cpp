@@ -6,6 +6,17 @@ keys:
   your-api-key: "replace-with-a-long-random-secret"
 room:
   enable_remote_unmute: false
+# Byte limits; 0 disables the corresponding content limit. Transport limits remain.
+limit:
+  max_room_name_length: 256
+  max_participant_identity_length: 256
+  max_participant_name_length: 256
+  max_metadata_size: 524288
+  max_attributes_size: 65536
 rtc:
   port_range_start: 50000
   port_range_end: 50100
+  congestion_control:
+    enabled: true
+    # Go default: keep an available base layer when bandwidth is insufficient.
+    allow_pause: false

@@ -1,6 +1,10 @@
 #include "lk/sfu.hpp"
+#include "lk/audio_activity.hpp"
 #include "lk/media_codec.hpp"
 #include "lk/native_rtp.hpp"
+#include "lk/forwarding_frame.hpp"
+#include <tuple>
+#include <cmath>
 #include "lk/video_allocation.hpp"
 #include <api/environment/environment_factory.h>
 #include <pc/rtp_transceiver.h>
@@ -17,6 +21,8 @@
 #include <rtc_base/task_utils/repeating_task.h>
 #ifdef _WIN32
 #include <rtc_base/task_queue_win.h>
+#include <rtc_base/win32.h>
+#include <mmsystem.h>
 #endif
 #include <algorithm>
 #include <cctype>
@@ -76,7 +82,9 @@ struct SendTransport {
   std::map<std::string,std::weak_ptr<Output>> outputs;
   webrtc::RepeatingTaskHandle allocation_task;
   MediaAllocation allocation;
-  SendTransport(const webrtc::Environment&,std::shared_ptr<Counters>,webrtc::TaskQueueBase*);
+  int64_t next_pause_diagnostic=0;
+  bool congestion_control=true,allow_pause=false;
+  SendTransport(const webrtc::Environment&,std::shared_ptr<Counters>,webrtc::TaskQueueBase*,bool,bool);
   void allocate();
   void ready() { native->set_available(transport && transport->IsSrtpActive() && transport->IsWritable(false)); }
   void unbind() {
@@ -114,12 +122,16 @@ struct Source : webrtc::RtpPacketSinkInterface {
   struct Layer {
     LayerSpec spec;
     uint32_t width=0,height=0;
+    std::vector<VideoLayerChoice> spatial_layers;
     webrtc::Timestamp last_packet=webrtc::Timestamp::MinusInfinity(),last_frame=webrtc::Timestamp::MinusInfinity();
     std::unique_ptr<NativeRtpReceiver> receiver;
     std::unique_ptr<NativeVideoAssembler> assembler;
     webrtc::RateStatistics demand{2000,webrtc::RateStatistics::kBpsScale};
     webrtc::Timestamp first_sample=webrtc::Timestamp::MinusInfinity();
     std::set<int64_t> measured_frames;
+    std::map<std::pair<int,int>,webrtc::RateStatistics> layer_bytes,layer_frames;
+    int temporal_layers=1;
+    MediaQuality quality;
     int64_t demand_bps(webrtc::Timestamp now,bool audio) const {
       int64_t fallback=audio ? 64000 : (width ? (uint64_t(width)*height<=320*240 ? 150000 :
         uint64_t(width)*height<=640*360 ? 450000 : 1200000) : (spec.quality==0 ? 150000 : spec.quality==1 ? 450000 : 1200000));
@@ -133,6 +145,7 @@ struct Source : webrtc::RtpPacketSinkInterface {
   std::vector<std::weak_ptr<Output>> outputs;
   std::shared_ptr<Counters> counters;
   NativeReceiveConfig config;
+  std::optional<webrtc::RtpCodecParameters> codec_parameters;
   std::map<uint32_t,std::unique_ptr<Layer>> layers;
   std::vector<LayerSpec> negotiated;
   std::map<std::string,int> rids;
@@ -140,6 +153,12 @@ struct Source : webrtc::RtpPacketSinkInterface {
   std::weak_ptr<ReceiveTransport> congestion;
   webrtc::RtpHeaderExtensionMap extensions;
   bool registered=false;
+  AudioActivity audio_activity;
+  struct Selection {uint32_t ssrc;int spatial=7,temporal=7;};
+  std::map<uint32_t,Selection> selections;
+  std::map<std::tuple<uint32_t,int,int>,uint32_t> selection_ids;
+  uint32_t next_selection=1;
+  Selection resolve(uint32_t id) const {auto it=selections.find(id);return it==selections.end()?Selection{id}:it->second;}
   uint64_t generation=0;
   Source(const webrtc::Environment& e,TrackRef t,std::shared_ptr<Counters> c) : env(e),track(std::move(t)),counters(std::move(c)) {}
   void OnRtpPacket(const webrtc::RtpPacketReceived& packet) override {
@@ -158,7 +177,7 @@ struct Source : webrtc::RtpPacketSinkInterface {
       }
       if (repair==repairs.end()) { ++counters->unmapped_packets; return; }
       primary=repair->second;
-    } else if (identified.PayloadType()==config.payload_type) {
+    } else if (identified.PayloadType()==config.payload_type || identified.PayloadType()==config.red_payload_type) {
       std::string rid; identified.GetExtension<webrtc::RtpStreamId>(&rid);
       if (!layers.contains(primary) && counters->unmapped_packets<5)
         RTC_LOG(LS_INFO)<<"SFU unknown primary "<<primary<<" rid="<<rid<<" negotiated-rids="<<rids.size()<<" known-layers="<<layers.size();
@@ -188,7 +207,7 @@ struct Source : webrtc::RtpPacketSinkInterface {
         choices.push_back({ssrc,layer->width,layer->height,layer->spec.quality});
     return select_video_layer(std::move(choices),settings);
   }
-  std::vector<VideoLayerRate> rates(const VideoSubscription& settings) const {
+  std::vector<VideoLayerRate> rates(const VideoSubscription& settings) {
     std::vector<VideoLayerRate> result;
     auto target=choose(settings); if (!target) return result;
     auto now=env.clock().CurrentTime();
@@ -199,7 +218,33 @@ struct Source : webrtc::RtpPacketSinkInterface {
       return a->spec.quality!=b->spec.quality ? a->spec.quality<b->spec.quality : a->spec.ssrc<b->spec.ssrc;
     });
     for (auto layer:ordered) {
-      result.push_back({layer->spec.ssrc,layer->demand_bps(now,false)});
+      if(layer->spatial_layers.empty() && layer->temporal_layers==1) {
+        result.push_back({layer->spec.ssrc,layer->demand_bps(now,false)});
+      }else {
+        int spatial_cap=layer->spatial_layers.empty()?0:int(select_video_layer(layer->spatial_layers,settings))-1;
+        spatial_cap=std::max(0,spatial_cap);
+        for(int spatial=0;spatial<=spatial_cap;++spatial) {
+          int temporal_cap=layer->temporal_layers-1;
+          if(settings.fps)for(int temporal=0;temporal<layer->temporal_layers;++temporal){
+            int64_t fps=0;
+            for(const auto& [indices,samples]:layer->layer_frames)if(indices.first==spatial && indices.second<=temporal)fps+=samples.Rate(now.ms()).value_or(0);
+            if(fps>=settings.fps*0.9){temporal_cap=temporal;break;}
+          }
+          for(int temporal=0;temporal<=temporal_cap;++temporal){
+            int64_t cost=0;
+            for(const auto& [indices,samples]:layer->layer_bytes)if(indices.first<=spatial && indices.second<=temporal)cost+=samples.Rate(now.ms()).value_or(0);
+            if(cost==0)cost=std::max<int64_t>(30000,layer->demand_bps(now,false)/(1<<(spatial_cap-spatial)));
+            auto key=std::tuple{layer->spec.ssrc,spatial,temporal};
+            auto it=selection_ids.find(key);
+            if(it==selection_ids.end()){
+              while(!next_selection || layers.contains(next_selection) || selections.contains(next_selection))++next_selection;
+              it=selection_ids.emplace(key,next_selection++).first;
+              selections.emplace(it->second,Selection{layer->spec.ssrc,spatial,temporal});
+            }
+            result.push_back({it->second,cost});
+          }
+        }
+      }
       if (layer->spec.ssrc==target) break;
     }
     return result;
@@ -216,7 +261,7 @@ struct Source : webrtc::RtpPacketSinkInterface {
     if (!spec.ssrc || layers.contains(spec.ssrc)) return;
     auto layer=std::make_unique<Layer>(); layer->spec=spec;
     auto receive_config=config; receive_config.ssrc=spec.ssrc;
-    if (!config.audio) layer->assembler=std::make_unique<NativeVideoAssembler>([this,id=spec.ssrc](const auto& frame){route_frame(id,frame);},config.video_codec);
+    if (!config.audio) layer->assembler=std::make_unique<NativeVideoAssembler>([this,id=spec.ssrc](const auto& frame){route_frame(id,frame);},config.video_codec,config.encrypted || (config.video_codec==webrtc::kVideoCodecH264 && !config.h264_packetization_mode));
     layer->receiver=std::make_unique<NativeRtpReceiver>(env,receive_config,
       [this,id=spec.ssrc](const auto& packet){route(id,packet);},[this](Bytes packet) {
         bool sent=send_packet(transport,packet,true);
@@ -231,7 +276,7 @@ struct Source : webrtc::RtpPacketSinkInterface {
   }
   void configure(const NativeReceiveConfig& next,const std::vector<LayerSpec>& specs,const std::map<std::string,int>& allowed_rids) {
     if (config==next && negotiated==specs && rids==allowed_rids) return;
-    layers.clear(); repairs.clear(); config=next; negotiated=specs; rids=allowed_rids;
+    layers.clear(); repairs.clear(); selections.clear();selection_ids.clear();config=next; negotiated=specs; rids=allowed_rids;
     ++generation;
     extensions=webrtc::RtpHeaderExtensionMap(config.extensions);
     RTC_LOG(LS_INFO)<<"SFU source config track="<<track->id()<<" layers="<<specs.size()<<" rids="<<rids.size();
@@ -243,10 +288,15 @@ struct Source : webrtc::RtpPacketSinkInterface {
 struct Output : std::enable_shared_from_this<Output> {
   std::string sender_id;
   std::shared_ptr<Source> source;
+  std::vector<std::shared_ptr<Source>> variants;
   Transport* transport=nullptr;
   NativeSendConfig config;
+  std::optional<webrtc::RtpCodecParameters> negotiated_codec;
+  MediaQuality quality;
   std::shared_ptr<SendTransport> paced;
   std::unique_ptr<NativeRtpSender> sender;
+  std::optional<NativeRtpSender::Continuity> continuity;
+  void reset_sender(){if(sender)continuity=sender->continuity();sender.reset();}
   bool enabled=true,started=false;
   VideoSubscription settings;
   VideoAllocationState allocation;
@@ -254,10 +304,14 @@ struct Output : std::enable_shared_from_this<Output> {
   uint32_t active_layer=0;
   uint64_t source_generation=0;
   uint64_t subscription_order=0;
+  std::optional<uint32_t> svc_timestamp;
+  int svc_cap=7,temporal_cap=7;
   void configure(const webrtc::Environment& env,const NativeSendConfig& next,std::shared_ptr<SendTransport> next_transport) {
     if (sender && config==next && paced==next_transport) return;
-    sender.reset(); paced=std::move(next_transport);
+    reset_sender(); paced=std::move(next_transport);
     config=next; started=false; active_layer=0; source_generation=source->generation;
+    quality=MediaQuality{};
+    svc_timestamp.reset(); svc_cap=7;
     RTC_LOG(LS_INFO)<<"SFU sender mid="<<config.mid<<" ssrc="<<config.ssrc
       <<" rtx="<<config.rtx_ssrc.value_or(0)<<" extensions="<<config.extensions.size();
     allocation={}; allocated_bps=0;
@@ -269,7 +323,8 @@ struct Output : std::enable_shared_from_this<Output> {
         else if (packet.packet_type()!=webrtc::RtpPacketMediaType::kPadding) ++source->counters->forwarded;
       } else ++source->counters->dropped;
       return sent;
-    },[this]{if (allocation.selected) source->keyframe(allocation.selected);},paced->native);
+    },[this]{if (allocation.selected) source->keyframe(source->resolve(allocation.selected).ssrc);},paced->native);
+    if(continuity)sender->restore_continuity(*continuity);
     sender->set_enabled(enabled);
     if (!config.audio) sender->set_media_paused(true);
   }
@@ -277,7 +332,7 @@ struct Output : std::enable_shared_from_this<Output> {
     if (!enabled || !transport || !sender) return;
     paced->ready();
     if (!started) { started=true; source->keyframe(); }
-    sender->forward(packet);
+    sender->forward(packet,source->config.red_payload_type,source->config.payload_type,source->config.encrypted);
   }
   void sender_report(const webrtc::rtcp::SenderReport& report) {
     if (!enabled || !started || !sender) return;
@@ -289,17 +344,33 @@ struct Output : std::enable_shared_from_this<Output> {
     if (!enabled || !transport || !sender) return;
     if (source_generation!=source->generation) {
       source_generation=source->generation; active_layer=0; started=false;
+      svc_timestamp.reset(); svc_cap=7;
       sender->set_enabled(false); sender->set_enabled(true);
     }
-    auto target=allocation.selected;
+    auto selection=source->resolve(allocation.selected);
+    auto target=selection.ssrc;
     if (!target) return;
     if (target!=active_layer && !(layer==target && frame.is_keyframe())) source->keyframe(target);
     bool switching=layer==target && (layer!=active_layer || !started) && frame.is_keyframe();
     // Keep the previous layer while waiting for the target's keyframe. A
     // subscriber's native sender verifies dependencies and rewrites frame IDs.
     if (!switching && (layer!=active_layer || !started)) return;
+    {
+      // A spatial target is fixed for the whole picture. Retain every lower
+      // dependency layer and put the RTP marker on the selected upper layer.
+      if (!svc_timestamp || *svc_timestamp!=frame.RtpTimestamp()) {
+        svc_timestamp=frame.RtpTimestamp(); svc_cap=7;
+        temporal_cap=selection.temporal;
+        const auto selected=select_video_layer(source->layers.at(layer)->spatial_layers,settings);
+        if (selected) svc_cap=int(selected)-1;
+        svc_cap=std::min(svc_cap,selection.spatial);
+      }
+      const int spatial=frame_spatial(frame);
+      if (spatial>svc_cap) return;
+    }
     paced->ready();
-    if (sender->forward_frame(frame,layer)) {
+    if(frame_temporal(frame)>temporal_cap)return;
+    if (sender->forward_frame(frame,layer,svc_cap,temporal_cap)) {
       if (active_layer && active_layer!=layer) ++source->counters->layer_switches;
       active_layer=layer;
       started=true; ++source->counters->forwarded_frames;
@@ -309,22 +380,24 @@ struct Output : std::enable_shared_from_this<Output> {
     if (allocation.selected!=next.selected)
       RTC_LOG(LS_INFO)<<"SFU allocation mid="<<config.mid<<" selected="<<next.selected<<" cost="<<cost;
     if (allocation.selected && !next.selected) ++source->counters->bandwidth_pauses;
+    const auto previous_selection=source->resolve(allocation.selected);
     allocation=next; allocated_bps=cost;
     if (!sender) return;
     if (!next.selected) { sender->set_media_paused(true); started=false; return; }
     auto active=source->layers.find(active_layer);
     // A downshift must also cancel already queued high-layer packets. The old
     // layer may continue during a switch only while it fits the new allocation.
-    if (active_layer!=next.selected && (active==source->layers.end() ||
-        active->second->demand_bps(source->env.clock().CurrentTime(),false)>cost)) {
+    const auto selected=source->resolve(next.selected);
+    if ((active_layer==selected.ssrc && (selected.spatial<previous_selection.spatial || selected.temporal<previous_selection.temporal)) || (active_layer!=selected.ssrc && (active==source->layers.end() ||
+        active->second->demand_bps(source->env.clock().CurrentTime(),false)>cost))) {
       sender->set_media_paused(true); started=false;
     }
     sender->set_media_paused(false);
-    if (active_layer!=next.selected || !started) source->keyframe(next.selected);
+    if (active_layer!=selected.ssrc || !started || selected.spatial>previous_selection.spatial || selected.temporal>previous_selection.temporal) source->keyframe(selected.ssrc);
   }
 };
-SendTransport::SendTransport(const webrtc::Environment& e,std::shared_ptr<Counters> c,webrtc::TaskQueueBase* timer)
-    : env(e),native(std::make_shared<NativeSendTransport>(env,4*1024*1024,timer)),counters(std::move(c)) {
+SendTransport::SendTransport(const webrtc::Environment& e,std::shared_ptr<Counters> c,webrtc::TaskQueueBase* timer,bool enabled,bool pause)
+    : env(e),native(std::make_shared<NativeSendTransport>(env,4*1024*1024,timer)),counters(std::move(c)),congestion_control(enabled),allow_pause(pause) {
   allocation_task=webrtc::RepeatingTaskHandle::Start(webrtc::TaskQueueBase::Current(),[this] {
     allocate(); return webrtc::TimeDelta::Millis(200);
   },webrtc::TaskQueueBase::DelayPrecision::kLow,&env.clock());
@@ -351,7 +424,27 @@ void SendTransport::allocate() {
     for (auto layer:request.layers) maximum=std::max(maximum,layer.bps);
     demand+=maximum; needs_growth|=request.state.selected!=request.layers.back().ssrc;
   }
-  allocation=allocate_video_bandwidth(native->stats().target_bps,audio,env.clock().TimeInMilliseconds(),requests);
+  allocation=allocate_video_bandwidth(native->stats().target_bps,audio,env.clock().TimeInMilliseconds(),requests,allow_pause);
+  if(!congestion_control){
+    allocation.video_allocated_bps=0;allocation.paused=0;
+    for(auto& request:requests){
+      request.state.pending=0;
+      request.state.selected=request.layers.empty()?0:request.layers.back().ssrc;
+      request.state.initialized|=request.state.selected!=0;
+      if(request.state.selected)allocation.video_allocated_bps+=request.layers.back().bps;
+      else ++allocation.paused;
+    }
+  }
+  if(allocation.paused && env.clock().TimeInMilliseconds()>=next_pause_diagnostic){
+    next_pause_diagnostic=env.clock().TimeInMilliseconds()+5000;
+    for(size_t i=0;i<requests.size();++i)if(!requests[i].state.selected){
+      const auto stats=native->stats();
+      RTC_LOG(LS_INFO)<<"SFU paused mid="<<videos[i]->config.mid<<" track="<<videos[i]->source->track->id()
+        <<" target="<<stats.target_bps<<" budget="<<allocation.media_budget_bps
+        <<" demand="<<(requests[i].layers.empty()?0:requests[i].layers.front().bps)
+        <<" choices="<<requests[i].layers.size()<<" probes="<<stats.probe_packets<<" probe-feedback="<<stats.probe_feedback_packets;
+    }
+  }
   // Preserve native ALR probing when admitted media is already well below
   // target. Filling all spare capacity with padding would conceal ALR and
   // leave a partially paused subscriber on slow additive growth instead.
@@ -376,26 +469,44 @@ void Source::route(uint32_t id,const webrtc::RtpPacketReceived& packet) {
   if (packet.payload_size()) {
     auto now=env.clock().CurrentTime(); if (layer.first_sample.IsInfinite()) layer.first_sample=now;
     layer.demand.Update(int64_t(packet.payload_size()+80),now.ms());
+    webrtc::AudioLevel level;
+    if(packet.GetExtension<webrtc::AudioLevelExtension>(&level))audio_activity.observe(level.level(),packet.Timestamp(),config.clock_rate_hz,now.ms());
   }
   for (auto it=outputs.begin();it!=outputs.end();) {
-    if (auto output=it->lock()) { output->forward(packet); ++it; }
+    if (auto output=it->lock()) { if(output->source.get()==this)output->forward(packet); ++it; }
     else it=outputs.erase(it);
   }
 }
 void Source::route_frame(uint32_t id,const webrtc::EncodedFrame& frame) {
   auto& layer=*layers.at(id);
+  if (const auto* vp9=native_vp9_header(frame); vp9 && vp9->ss_data_available && vp9->spatial_layer_resolution_present) {
+    layer.spatial_layers.clear();
+    for (size_t i=0;i<vp9->num_spatial_layers;++i)
+      layer.spatial_layers.push_back({uint32_t(i+1),vp9->width[i],vp9->height[i],int(i)});
+  }
+  if(const auto* forwarded=dynamic_cast<const ForwardingFrame*>(&frame);forwarded && forwarded->structure && !forwarded->structure->resolutions.empty()) {
+    layer.spatial_layers.clear();int i=0;
+    for(const auto& size:forwarded->structure->resolutions){layer.spatial_layers.push_back({uint32_t(i+1),uint32_t(size.Width()),uint32_t(size.Height()),i});++i;}
+  }
   ++counters->assembled_frames;
   // RTX/payload padding can make native assembly emit an already seen frame.
   // Only unique complete encoded frames contribute to media demand/activity.
   if (layer.measured_frames.insert(frame.Id()).second) {
     auto now=env.clock().CurrentTime(); layer.last_frame=now;
     if (layer.first_sample.IsInfinite()) layer.first_sample=now;
-    layer.demand.Update(int64_t(frame.size()+((frame.size()+1099)/1100)*80),now.ms());
+    auto bytes=int64_t(frame.size()+((frame.size()+1099)/1100)*80);
+    layer.demand.Update(bytes,now.ms());
+    auto indices=std::pair{frame_spatial(frame),frame_temporal(frame)};
+    layer.temporal_layers=std::max(layer.temporal_layers,indices.second+1);
+    layer.layer_bytes.try_emplace(indices,2000,webrtc::RateStatistics::kBpsScale).first->second.Update(bytes,now.ms());
+    layer.layer_frames.try_emplace(indices,2000,1000).first->second.Update(1,now.ms());
     while (layer.measured_frames.size()>512) layer.measured_frames.erase(layer.measured_frames.begin());
   }
   if (frame._encodedWidth && frame._encodedHeight) { layer.width=frame._encodedWidth; layer.height=frame._encodedHeight; }
+  if(!layer.spatial_layers.empty()){layer.width=layer.spatial_layers.back().width;layer.height=layer.spatial_layers.back().height;}
   for (auto it=outputs.begin();it!=outputs.end();) {
     if (auto output=it->lock()) {
+      if(output->source.get()!=this){++it;continue;}
       // Discovery can make a base layer affordable on this very keyframe.
       // Allocate now rather than discarding it until the next 200 ms tick,
       // which would also incur another upstream PLI/keyframe round trip.
@@ -408,6 +519,7 @@ void Source::route_frame(uint32_t id,const webrtc::EncodedFrame& frame) {
 }
 struct Snapshot {
   bool sending = false;
+  bool extmap_allow_mixed=false;
   webrtc::BaseChannel* channel=nullptr;
   std::string mid,sender_id;
   TrackRef track;
@@ -418,8 +530,29 @@ int primary_codec(const webrtc::RtpParameters& p,bool audio) {
   const auto codec=primary_media_codec(p,audio); return codec ? codec->payload_type : -1;
 }
 webrtc::VideoCodecType video_codec_type(const webrtc::RtpParameters& p,int payload_type) {
-  for (const auto& codec:p.codecs) if (codec.payload_type==payload_type && codec_name(codec.name)=="h264") return webrtc::kVideoCodecH264;
+  for (const auto& codec:p.codecs) if (codec.payload_type==payload_type) {
+    if (codec_name(codec.name)=="h264") return webrtc::kVideoCodecH264;
+    if (codec_name(codec.name)=="vp9") return webrtc::kVideoCodecVP9;
+    if (codec_name(codec.name)=="av1") return webrtc::kVideoCodecAV1;
+    if (codec_name(codec.name)=="h265") return webrtc::kVideoCodecH265;
+  }
   return webrtc::kVideoCodecVP8;
+}
+int audio_red_codec(const webrtc::RtpParameters& p,int primary) {
+  for(const auto& codec:p.codecs)if(codec_name(codec.name)=="red" && codec.clock_rate==48000) {
+    auto fmtp=codec.parameters.find("");
+    if(fmtp==codec.parameters.end())continue;
+    auto expected=std::to_string(primary);std::string value=fmtp->second;bool valid=!value.empty();
+    for(size_t offset=0;offset<value.size();){auto end=value.find('/',offset);if(end==std::string::npos)end=value.size();valid&=value.substr(offset,end-offset)==expected;offset=end+1;}
+    if(valid)return codec.payload_type;
+  }
+  return -1;
+}
+int h264_mode(const webrtc::RtpParameters& p,int primary) {
+  for(const auto& codec:p.codecs)if(codec.payload_type==primary && codec_name(codec.name)=="h264") {
+    auto mode=codec.parameters.find("packetization-mode");return mode!=codec.parameters.end() && mode->second=="1" ? 1 : 0;
+  }
+  return 1;
 }
 int rtx_codec(const webrtc::RtpParameters& p,int primary) {
   for (const auto& codec:p.codecs) if (lower(codec.name)=="rtx") {
@@ -431,7 +564,17 @@ int rtx_codec(const webrtc::RtpParameters& p,int primary) {
 }
 struct SfuRouter::Impl {
   webrtc::Thread *signaling,*network,*worker;
+  bool congestion_control=true,allow_pause=false;
 #ifdef _WIN32
+  // TaskQueueWin's multimedia timer uses the process timer resolution. Its
+  // short-lived request inside CurrentTime() only improves clock reads, not
+  // subsequent timer waits. Hold the same 1 ms request as WebRTC's own task
+  // queue tests, otherwise 1 ms probe intervals can become 15.6 ms on Windows
+  // and repeatedly expire before enough probe bytes reach the receiver.
+  struct TimerResolution {
+    bool enabled=timeBeginPeriod(1)==TIMERR_NOERROR;
+    ~TimerResolution(){if(enabled)timeEndPeriod(1);}
+  } timer_resolution;
   webrtc::Environment env=webrtc::CreateEnvironment(webrtc::CreateTaskQueueWinFactory());
 #else
   webrtc::Environment env=webrtc::CreateEnvironment();
@@ -453,6 +596,7 @@ struct SfuRouter::Impl {
 struct SfuSession::State : std::enable_shared_from_this<State> {
   std::shared_ptr<SfuRouter::Impl> router;
   bool subscriber, bidirectional;
+  std::map<std::string,bool> encrypted_publications;
   std::map<std::string,std::shared_ptr<Output>> outputs;
   std::vector<std::shared_ptr<Source>> inputs;
   // Transport ownership of a weak observer token prevents callback accumulation
@@ -508,17 +652,32 @@ struct SfuSession::State : std::enable_shared_from_this<State> {
       if (s.sending) {
         auto& sender=send_transports[transport];
         if (!sender || observers[transport].expired()) {
-          sender=std::make_shared<SendTransport>(router->env,router->counters,router->pacer_timer.get());
+          sender=std::make_shared<SendTransport>(router->env,router->counters,router->pacer_timer.get(),router->congestion_control,router->allow_pause);
           router->senders.push_back(sender);
         }
         sender->bind(transport);
         for (auto& [_,out]:outputs) if (out->sender_id==s.sender_id) {
           NativeSendConfig config;
           config.audio=out->source->track->kind()=="audio";
-          config.payload_type=primary_codec(s.parameters,config.audio);
-          if (config.payload_type<0) continue;
+          out->negotiated_codec=primary_media_codec(s.parameters,config.audio);
+          // Regression can switch to a backup PT already negotiated on this
+          // MID. In single-PC mode a zero-section request does not cause the
+          // SDK to generate another offer, so do not rely on SDP reordering.
+          if(out->variants.size()==1 && out->source->codec_parameters)
+            for(const auto& codec:s.parameters.codecs)if(forwarding_codec(codec) && same_forwarding_codec(codec,*out->source->codec_parameters)){out->negotiated_codec=codec;break;}
+          if(!out->negotiated_codec)continue;
+          config.payload_type=out->negotiated_codec->payload_type;
           config.video_codec=video_codec_type(s.parameters,config.payload_type);
+          auto matches=[&](const auto& source){return source->codec_parameters && out->negotiated_codec && same_forwarding_codec(*source->codec_parameters,*out->negotiated_codec);};
+          if(!matches(out->source)) {
+            auto found=std::find_if(out->variants.begin(),out->variants.end(),matches);
+            if(found==out->variants.end()){out->reset_sender();out->transport=nullptr;out->started=false;continue;}
+            out->source=*found;out->reset_sender();
+          }
+          config.h264_packetization_mode=h264_mode(s.parameters,config.payload_type);
+          if(config.audio)config.red_payload_type=audio_red_codec(s.parameters,config.payload_type);
           config.ssrc=ssrc; config.mid=s.mid; config.extensions=s.parameters.header_extensions;
+          config.extmap_allow_mixed=s.extmap_allow_mixed;
           config.rtx_payload_type=rtx_codec(s.parameters,config.payload_type);
           for (const auto& stream:s.streams) {
             uint32_t rtx=0; if (stream.GetFidSsrc(ssrc,&rtx)) config.rtx_ssrc=rtx;
@@ -533,11 +692,15 @@ struct SfuSession::State : std::enable_shared_from_this<State> {
         input->congestion=receiver;
         NativeReceiveConfig config;
         config.audio=s.track->kind()=="audio";
+        config.encrypted=encrypted_publications.contains(s.track->id()) && encrypted_publications.at(s.track->id());
         const auto codec=primary_media_codec(s.parameters,config.audio);
         if (!codec || !codec->clock_rate) continue;
+        input->codec_parameters=codec;
         config.payload_type=codec->payload_type;
         config.clock_rate_hz=*codec->clock_rate;
         config.video_codec=video_codec_type(s.parameters,config.payload_type);
+          config.h264_packetization_mode=h264_mode(s.parameters,config.payload_type);
+          if(config.audio)config.red_payload_type=audio_red_codec(s.parameters,config.payload_type);
         config.rtx_payload_type=rtx_codec(s.parameters,config.payload_type);
         config.extensions=s.parameters.header_extensions;
         std::vector<LayerSpec> specs;
@@ -589,6 +752,12 @@ SfuRouter::SfuRouter(webrtc::Thread* signaling,webrtc::Thread* network,webrtc::T
   impl_->signaling=signaling; impl_->network=network; impl_->worker=worker;
 }
 SfuRouter::~SfuRouter()=default;
+void SfuRouter::configure_congestion_control(bool enabled,bool allow_pause){
+  impl_->network->BlockingCall([&]{
+    impl_->congestion_control=enabled;impl_->allow_pause=allow_pause;
+    for(auto& weak:impl_->senders)if(auto sender=weak.lock()){sender->congestion_control=enabled;sender->allow_pause=allow_pause;sender->allocate();}
+  });
+}
 Json SfuRouter::metrics() const {
   return impl_->network->BlockingCall([&] {
     auto& c=*impl_->counters;
@@ -636,12 +805,25 @@ SfuSession::~SfuSession() {
     state_->outputs.clear(); state_->inputs.clear(); state_->receive_transports.clear(); state_->send_transports.clear();
   });
 }
-void SfuSession::add(const std::string& sid,const std::string& sender_id,TrackRef track) {
+void SfuSession::add(const std::string& sid,const std::string& sender_id,TrackRef track,const std::vector<TrackRef>& variants) {
   state_->router->network->BlockingCall([&] {
-    if (state_->outputs.contains(sid)) return;
-    auto out=std::make_shared<Output>(); out->sender_id=sender_id;
-    out->subscription_order=++state_->router->counters->next_subscription;
-    out->source=state_->router->source(track); out->source->outputs.push_back(out); state_->outputs[sid]=out;
+    auto& out=state_->outputs[sid];
+    if(!out){out=std::make_shared<Output>();out->sender_id=sender_id;out->subscription_order=++state_->router->counters->next_subscription;out->source=state_->router->source(track);}
+    for(auto it=out->variants.begin();it!=out->variants.end();) {
+      if((*it)->track!=track && std::find(variants.begin(),variants.end(),(*it)->track)==variants.end()){
+        auto& attached=(*it)->outputs;
+        std::erase_if(attached,[&](const auto& weak){auto existing=weak.lock();return !existing || existing==out;});
+        it=out->variants.erase(it);
+      }else ++it;
+    }
+    if(out->source->track!=track && std::find(variants.begin(),variants.end(),out->source->track)==variants.end()){
+      out->reset_sender();out->transport=nullptr;out->started=false;out->source=state_->router->source(track);
+    }
+    auto attach=[&](TrackRef media){
+      auto source=state_->router->source(media);
+      if(std::find(out->variants.begin(),out->variants.end(),source)==out->variants.end()){out->variants.push_back(source);source->outputs.push_back(out);}
+    };
+    attach(track);for(const auto& variant:variants)attach(variant);
   });
 }
 void SfuSession::remove(const std::string& sid) {
@@ -656,12 +838,62 @@ void SfuSession::enable(const std::string& sid,bool enabled) {
     if (enabled) out.source->keyframe();
   });
 }
+void SfuSession::publication(const std::string& cid,std::optional<bool> encrypted) {
+  state_->router->network->BlockingCall([&]{
+    if(encrypted)state_->encrypted_publications[cid]=*encrypted;
+    else state_->encrypted_publications.erase(cid);
+  });
+}
+std::map<std::string,MediaSubscriptionState> SfuSession::states() const {
+  return state_->router->network->BlockingCall([&]{
+    std::map<std::string,MediaSubscriptionState> result;
+    for(const auto& [sid,out]:state_->outputs){
+      auto q=out->sender?out->sender->quality():NativeRtpSender::Quality{};
+      result[sid]={out->enabled && out->started && (out->config.audio || out->allocation.selected!=0),q.has_feedback,q.loss,q.rtt_ms};
+      if(out->negotiated_codec)result[sid].codec=codec_name(out->negotiated_codec->name);
+      double distance=0;
+      if(!out->config.audio && out->allocation.selected){
+        auto selected=out->source->resolve(out->allocation.selected);
+        auto desired=out->source->choose(out->settings);
+        auto active=out->source->layers.find(selected.ssrc),target=out->source->layers.find(desired);
+        if(active!=out->source->layers.end() && target!=out->source->layers.end()){
+          distance=std::max(0,target->second->spec.quality-active->second->spec.quality);
+          if(!active->second->spatial_layers.empty())distance=std::max(0,int(select_video_layer(active->second->spatial_layers,out->settings))-1-selected.spatial);
+        }
+      }
+      double weight=out->config.audio ? (out->config.red_payload_type>=0?4:result[sid].codec=="opus"?8:0) : 10;
+      if(out->config.red_payload_type>=0 || (out->negotiated_codec && out->negotiated_codec->parameters.contains("useinbandfec") && out->negotiated_codec->parameters.at("useinbandfec")=="1"))weight/=1.5;
+      out->quality.update(state_->router->env.clock().CurrentTime().ms(),q,weight,!out->enabled,
+        out->enabled && out->sender && !out->config.audio && !out->allocation.selected,distance);
+      result[sid].quality_score=out->quality.score();
+    }
+    return result;
+  });
+}
+std::map<const webrtc::MediaStreamTrackInterface*,MediaSourceState> SfuRouter::source_states(const std::set<const webrtc::MediaStreamTrackInterface*>& muted) const {
+  return impl_->network->BlockingCall([&]{
+    std::map<const webrtc::MediaStreamTrackInterface*,MediaSourceState> result;
+    for(const auto& [key,weak]:impl_->sources)if(auto source=weak.lock()) {
+      auto& state=result[key];
+      state.audio_level=source->audio_activity.level(impl_->env.clock().CurrentTime().ms());
+      for(const auto& [ssrc,layer]:source->layers){
+        state.layers.push_back({ssrc,layer->width,layer->height,layer->spec.quality});
+        double weight=source->config.audio ? (source->config.red_payload_type>=0?4:source->codec_parameters && codec_name(source->codec_parameters->name)=="opus"?8:0) : 10;
+        if(source->config.red_payload_type>=0 || (source->codec_parameters && source->codec_parameters->parameters.contains("useinbandfec") && source->codec_parameters->parameters.at("useinbandfec")=="1"))weight/=1.5;
+        layer->quality.update(impl_->env.clock().CurrentTime().ms(),layer->receiver->quality(),weight,muted.contains(key),false);
+        state.quality_score=std::min(state.quality_score,layer->quality.score());
+      }
+    }
+    return result;
+  });
+}
 void SfuSession::settings(const std::string& sid,const VideoSubscription& settings) {
   state_->router->network->BlockingCall([&] {
     auto it=state_->outputs.find(sid); if (it==state_->outputs.end()) return;
     auto& out=*it->second;
     if (out.settings==settings) return;
     out.settings=settings;
+    out.source->keyframe();
     if (out.paced) out.paced->allocate();
   });
 }
@@ -713,7 +945,10 @@ void SfuSession::refresh(webrtc::scoped_refptr<webrtc::PeerConnectionInterface> 
       if (accepted && accepted->GetType()==webrtc::SdpType::kOffer) accepted=pc->remote_description();
       if (accepted) {
         const auto* content=accepted->description()->GetContentByName(s.mid);
-        if (content && content->media_description()) negotiated_codecs(s.parameters,*content->media_description());
+        if (content && content->media_description()) {
+          negotiated_codecs(s.parameters,*content->media_description());
+          s.extmap_allow_mixed=content->media_description()->extmap_allow_mixed();
+        }
       }
       // RID-only receivers have no native receive stream yet, and M137's
       // default receiver parameters omit the negotiated extension map. Read

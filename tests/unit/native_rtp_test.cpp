@@ -7,6 +7,8 @@
 #include <modules/rtp_rtcp/source/rtcp_packet/nack.h>
 #include <modules/rtp_rtcp/source/rtcp_packet/pli.h>
 #include <modules/rtp_rtcp/source/rtcp_packet/transport_feedback.h>
+#include <modules/rtp_rtcp/source/rtp_format_vp9.h>
+#include <modules/rtp_rtcp/source/video_rtp_depacketizer_vp9.h>
 #include <rtc_base/thread.h>
 #include <system_wrappers/include/clock.h>
 #include <algorithm>
@@ -51,6 +53,38 @@ webrtc::EncodedFrame encoded(int64_t id,uint32_t timestamp,bool key=true,size_t 
   frame.rotation_=webrtc::kVideoRotation_90;
   frame.num_references=key ? 0 : 1; if (!key) frame.references[0]=id-1;
   return frame;
+}
+void run_sender_reconfiguration() {
+  webrtc::SimulatedClock clock(1000000); auto env=webrtc::CreateEnvironment(&clock);
+  lk::NativeSendConfig config; config.ssrc=111; config.rtx_ssrc=112; config.payload_type=100; config.rtx_payload_type=101;
+  std::vector<webrtc::RtpPacketToSend> output;
+  lk::NativeRtpSender::Continuity previous;
+  {
+    lk::NativeRtpSender sender(env,config,[&](const auto& p){output.push_back(p);return true;},[]{});
+    check(sender.forward_frame(encoded(1,90000),11),"Initial reconfiguration frame rejected");
+    previous=sender.continuity();
+    check(previous.packets>0 && previous.octets>0,"Missing sender accounting before reconfiguration");
+  }
+  const auto sequence=output.back().SequenceNumber();
+  const auto timestamp=output.back().Timestamp();
+  output.clear(); clock.AdvanceTimeMilliseconds(40);
+  // A codec renegotiation replaces the sender while retaining the outgoing
+  // SSRC. Its source timestamp and RTP payload type need not remain the same.
+  config.payload_type=102;
+  lk::NativeRtpSender replacement(env,config,[&](const auto& p){output.push_back(p);return true;},[]{});
+  replacement.restore_continuity(previous);
+  check(!replacement.forward_frame(encoded(2,1000,false),22),"Replacement accepted a delta before its first keyframe");
+  check(replacement.forward_frame(encoded(3,4000),22),"Replacement keyframe rejected");
+  check(output.front().SequenceNumber()==uint16_t(sequence+1),"Reconfigured sender reset RTP sequence");
+  check(int32_t(output.front().Timestamp()-timestamp)>0,"Reconfigured sender regressed RTP timestamp");
+  check(output.front().PayloadType()==102,"Reconfigured sender retained obsolete payload type");
+  auto resumed=replacement.continuity();
+  check(resumed.packets==previous.packets+output.size() && resumed.octets>previous.octets,"Reconfigured sender reset RTCP accounting");
+  check(resumed.rtx_sequence==previous.rtx_sequence,"Reconfigured sender reset RTX sequence");
+  config.ssrc=211;
+  lk::NativeRtpSender unrelated(env,config,[](const auto&){return true;},[]{});
+  unrelated.restore_continuity(previous);
+  check(unrelated.continuity().packets==0 && !unrelated.continuity().timestamp,"Continuity leaked to a different SSRC");
 }
 void run_frames() {
   webrtc::SimulatedClock clock(1000000); auto env=webrtc::CreateEnvironment(&clock);
@@ -195,6 +229,92 @@ void run_audio_codecs() {
     }
     check(packets.size()==3,"Audio forwarding lost a packet");
   }
+}
+void run_vp9_frames() {
+  webrtc::SimulatedClock clock(1000000); auto env=webrtc::CreateEnvironment(&clock);
+  webrtc::RtpCodecParameters codec; codec.name="VP9"; codec.clock_rate=90000;
+  check(lk::forwarding_codec(codec),"VP9 default profile zero not supported");
+  auto explicit_zero=codec;explicit_zero.parameters["profile-id"]="0";
+  check(lk::same_forwarding_codec(codec,explicit_zero),"VP9 default/explicit profile mismatch");
+  codec.parameters["profile-id"]="2";
+  check(lk::forwarding_codec(codec) && !lk::same_forwarding_codec(codec,explicit_zero),"VP9 profile matching ignored");
+  lk::NativeSendConfig config;config.ssrc=111;config.rtx_ssrc=112;config.payload_type=100;config.rtx_payload_type=101;config.video_codec=webrtc::kVideoCodecVP9;
+  std::vector<webrtc::RtpPacketToSend> upstream,high,low;
+  lk::NativeRtpSender publisher(env,config,[&](const auto& p){upstream.push_back(p);return true;},[]{});
+  auto output=config;output.ssrc=211;output.rtx_ssrc=212;output.payload_type=102;
+  lk::NativeRtpSender subscriber(env,output,[&](const auto& p){high.push_back(p);return true;},[]{});
+  output.ssrc=311;output.rtx_ssrc=312;
+  lk::NativeRtpSender base(env,output,[&](const auto& p){low.push_back(p);return true;},[]{});
+  std::vector<uint8_t> payload(4200,0x55); // Codec bytes are audited, not decoded by this native test.
+  auto bounded=std::make_shared<lk::NativeSendTransport>(env,6000);
+  std::vector<webrtc::RtpPacketToSend> recovered;
+  lk::NativeRtpSender congested(env,output,[&](const auto& p){
+    if(p.packet_type()==webrtc::RtpPacketMediaType::kVideo)recovered.push_back(p);
+    return true;
+  },[]{},bounded);
+  auto drain=[&]{bounded->set_available(true);for(int i=0;i<500;++i){bounded->process();clock.AdvanceTimeMilliseconds(1);}};
+  int assembled=0;
+  lk::NativeVideoAssembler assembler([&](const auto& frame) {
+    ++assembled;
+    if(assembled==1){
+      check(congested.forward_frame(frame,111),"VP9 queue rejected initial source");
+      check(!congested.forward_frame(frame,222),"VP9 source switch ignored queue overflow");
+      drain();
+    }else if(assembled==2){
+      check(congested.forward_frame(frame,111),"Rejected VP9 switch corrupted current dependencies");
+      drain();
+      webrtc::VideoRtpDepacketizerVp9 parser;
+      for(const auto& p:recovered){
+        auto parsed=parser.Parse(received(p).PayloadBuffer());
+        check(parsed.has_value(),"VP9 queued packet did not parse");
+        const auto& h=std::get<webrtc::RTPVideoHeaderVP9>(parsed->video_header.video_type_header);
+        check(h.picture_id==32767,"Rejected VP9 switch changed active picture ID offset");
+      }
+    }
+    check(frame.size()==payload.size() && std::equal(payload.begin(),payload.end(),frame.data()),"VP9 encoded bytes changed");
+    check(subscriber.forward_frame(frame,111),"VP9 same-picture spatial frame or temporal dependency rejected");
+    const auto* header=lk::native_vp9_header(frame);check(header,"VP9 native RTP metadata lost");
+    if (header->spatial_idx==0) check(base.forward_frame(frame,111,0),"VP9 independent base-layer subscription rejected");
+  },webrtc::kVideoCodecVP9);
+  lk::NativeReceiveConfig receive;receive.ssrc=111;receive.payload_type=100;receive.rtx_payload_type=101;receive.video_codec=webrtc::kVideoCodecVP9;
+  lk::NativeRtpReceiver receiver(env,receive,[&](const auto& p){assembler.receive(p);},[](Bytes){return true;});
+  uint16_t seq=65530;
+  for (int picture=0;picture<2;++picture) for (int spatial=0;spatial<3;++spatial) {
+    webrtc::RTPVideoHeaderVP9 h{};h.InitRTPVideoHeaderVP9();h.flexible_mode=true;
+    h.picture_id=int16_t(32767+picture)&0x7fff;h.temporal_idx=0;h.spatial_idx=uint8_t(spatial);
+    h.inter_pic_predicted=picture!=0;h.inter_layer_predicted=spatial!=0;
+    h.num_ref_pics=picture ? 1 : 0;h.pid_diff[0]=1;h.num_spatial_layers=3;h.end_of_picture=spatial==2;
+    h.ss_data_available=picture==0 && spatial==0;h.spatial_layer_resolution_present=true;
+    for(int i=0;i<3;++i){h.width[i]=uint16_t(320<<i);h.height[i]=uint16_t(180<<i);}
+    webrtc::RtpPacketizer::PayloadSizeLimits limits;limits.max_payload_len=1000;
+    webrtc::RtpPacketizerVp9 packetizer(payload,limits,h);const auto begin=upstream.size();
+    while(packetizer.NumPackets()) {
+      webrtc::RtpPacketToSend packet(nullptr);packet.SetSsrc(11);packet.SetPayloadType(100);packet.SetSequenceNumber(seq++);packet.SetTimestamp(90000+3000*picture);
+      check(packetizer.NextPacket(&packet),"Native VP9 fixture packetization failed");publisher.forward(received(packet));
+    }
+    const auto end=upstream.size();
+    for(size_t i=begin;i<end;++i) if(i!=begin+1) receiver.receive(received(upstream[i]));
+    check(assembled==picture*3+spatial,"Incomplete VP9 spatial frame escaped");
+    webrtc::rtcp::Nack nack;nack.SetSenderSsrc(999);nack.SetMediaSsrc(111);nack.SetPacketIds({upstream[begin+1].SequenceNumber()});
+    clock.AdvanceTimeMilliseconds(200);publisher.feedback(bytes(nack.Build()));
+    check(upstream.size()==end+1 && upstream.back().Ssrc()==112,"VP9 RTX did not repair a missing fragment");
+    receiver.receive(received(upstream.back()));
+    check(assembled==picture*3+spatial+1,"VP9 repaired frame was not forwarded");
+  }
+  auto verify=[&](const auto& packets,int expected,int spatial_layers) {
+    int count=0,markers=0;
+    lk::NativeVideoAssembler downstream([&](const auto& frame) {
+      ++count;check(frame.size()==payload.size() && std::equal(payload.begin(),payload.end(),frame.data()),"VP9 repacketization changed bitstream");
+      const auto* h=lk::native_vp9_header(frame);
+      if(h->ss_data_available) check(h->num_spatial_layers==spatial_layers,"VP9 outgoing scalability structure not clipped");
+    },webrtc::kVideoCodecVP9);
+    for(size_t i=0;i<packets.size();++i) {
+      if(i)check(packets[i].SequenceNumber()==uint16_t(packets[i-1].SequenceNumber()+1),"VP9 spatial filtering introduced sequence gaps");
+      if(packets[i].Marker())++markers;downstream.receive(received(packets[i]));
+    }
+    check(count==expected && markers==2,"VP9 reference/picture wrap or end-of-picture markers changed");
+  };
+  verify(high,6,3);verify(low,2,1);
 }
 void run_h264_frames() {
   webrtc::SimulatedClock clock(1000000); auto env=webrtc::CreateEnvironment(&clock);
@@ -366,8 +486,8 @@ int main() {
   auto thread=webrtc::Thread::Create(); thread->SetName("native-rtp-test",nullptr);
   if (!thread->Start()) return 1;
   std::string error;
-  thread->BlockingCall([&] { try {run();run_frames();run_h264_frames();run_audio_codecs();} catch (const std::exception& e) {error=e.what();} });
+  thread->BlockingCall([&] { try {run();run_frames();run_sender_reconfiguration();run_h264_frames();run_vp9_frames();run_audio_codecs();} catch (const std::exception& e) {error=e.what();} });
   thread->Stop();
   if (!error.empty()) { std::cerr << error << '\n'; return 1; }
-  std::cout << "PASS native RTP/RTCP, loss recovery, encoded VP8/H264 assembly/repacketization, frame switching and PCMU/PCMA/Opus clocks/payload preservation\n";
+  std::cout << "PASS native RTP/RTCP, loss recovery, encoded VP8/H264/VP9 assembly/repacketization, frame switching and PCMU/PCMA/Opus clocks/payload preservation\n";
 }

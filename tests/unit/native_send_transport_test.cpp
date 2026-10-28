@@ -71,6 +71,24 @@ struct NativeClockScope : webrtc::ClockInterface {
   ~NativeClockScope() override {webrtc::SetClockForTesting(previous);}
   int64_t TimeNanos() const override {return clock.CurrentTime().us()*1000;}
 };
+void advancing_clock_probe_test() {
+  // Unlike a frozen SimulatedClock, real time advances between the adapter's
+  // read and PacingController::NextSendTime(), which may return its own "now".
+  struct AdvancingClock : webrtc::SimulatedClock {
+    AdvancingClock():webrtc::SimulatedClock(1000000){}
+    webrtc::Timestamp CurrentTime() override {
+      AdvanceTimeMicroseconds(1);return webrtc::SimulatedClock::CurrentTime();
+    }
+  } clock;
+  NativeClockScope scope(clock);auto env=webrtc::CreateEnvironment(&clock);
+  auto transport=std::make_shared<lk::NativeSendTransport>(env);
+  lk::NativeSendConfig video;video.ssrc=111;video.rtx_ssrc=112;video.rtx_payload_type=97;
+  video.extensions={{webrtc::RtpExtension::kTransportSequenceNumberUri,5}};
+  lk::NativeRtpSender sender(env,video,[](const auto&){return true;},[]{},transport);
+  sender.set_media_paused(true);transport->set_available(true);
+  for(int ms=0;ms<300;++ms){transport->process();clock.AdvanceTimeMilliseconds(1);}
+  check(transport->stats().probe_packets>=5,"Advancing real clock starved the initial padding probe");
+}
 void shaped_link_test(bool cold_start=false,bool video_only=false) {
   webrtc::SimulatedClock clock(1000000);
   // M137's native AlrDetector records its start with global TimeMillis, whereas
@@ -306,7 +324,7 @@ int main() {
   auto thread=webrtc::Thread::Create(); thread->SetName("native-send-test",nullptr);
   if (!thread->Start()) return 1;
   std::string error;
-  thread->BlockingCall([&]{try {native_queue_pause_test();run();shaped_link_test();shaped_link_test(true);shaped_link_test(true,true);} catch(const std::exception& e){error=e.what();}});
+  thread->BlockingCall([&]{try {advancing_clock_probe_test();native_queue_pause_test();run();shaped_link_test();shaped_link_test(true);shaped_link_test(true,true);} catch(const std::exception& e){error=e.what();}});
   thread->Stop();
   if (!error.empty()) {std::cerr<<error<<'\n';return 1;}
   std::cout<<"PASS native pacing, audio priority, TWCC, bitrate feedback, RTX, mute and teardown\n";

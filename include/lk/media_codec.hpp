@@ -1,6 +1,9 @@
 #pragma once
 #include <api/rtp_parameters.h>
 #include <api/video_codecs/h264_profile_level_id.h>
+#include <api/video_codecs/vp9_profile.h>
+#include <api/video_codecs/av1_profile.h>
+#include <api/video_codecs/h265_profile_tier_level.h>
 #include <pc/session_description.h>
 #include <algorithm>
 #include <cctype>
@@ -31,12 +34,18 @@ inline void negotiated_codecs(webrtc::RtpParameters& parameters,const webrtc::Me
 inline bool forwarding_codec(const webrtc::RtpCodec& codec) {
   const auto name=codec_name(codec.name);
   if (name=="opus" || name=="vp8") return true;
+  if (name=="vp9") return webrtc::ParseSdpForVP9Profile(codec.parameters).has_value();
   if (name=="pcmu" || name=="pcma") return codec.clock_rate==8000 && codec.num_channels.value_or(1)==1;
-  // Non-interleaved H.264 supports native STAP-A/FU-A packetization. Mode 0
-  // needs a separate MTU contract and is not advertised until validated.
+  if (name=="av1") return webrtc::ParseSdpForAV1Profile(codec.parameters).has_value();
+  if (name=="h265") {
+    auto mode=codec.parameters.find("tx-mode");
+    return webrtc::ParseSdpForH265ProfileTierLevel(codec.parameters).has_value() &&
+      (mode==codec.parameters.end() || mode->second=="SRST");
+  }
   if (name=="h264") {
     const auto mode=codec.parameters.find("packetization-mode");
-    return mode!=codec.parameters.end() && mode->second=="1";
+    return webrtc::ParseSdpForH264ProfileLevelId(codec.parameters).has_value() &&
+      (mode==codec.parameters.end() || mode->second=="0" || mode->second=="1");
   }
   return false;
 }
@@ -49,6 +58,9 @@ inline std::optional<webrtc::RtpCodecParameters> primary_media_codec(const webrt
 }
 inline bool same_forwarding_codec(const webrtc::RtpCodec& a,const webrtc::RtpCodec& b) {
   if (codec_name(a.name)!=codec_name(b.name) || a.clock_rate!=b.clock_rate || a.num_channels!=b.num_channels) return false;
+  if (codec_name(a.name)=="vp9") return webrtc::VP9IsSameProfile(a.parameters,b.parameters);
+  if (codec_name(a.name)=="av1") return webrtc::AV1IsSameProfile(a.parameters,b.parameters);
+  if (codec_name(a.name)=="h265") return webrtc::H265IsSameProfile(a.parameters,b.parameters);
   if (codec_name(a.name)!="h264") return true;
   const auto mode=[](const auto& c) {auto it=c.parameters.find("packetization-mode");return it==c.parameters.end()?std::string("0"):it->second;};
   return mode(a)==mode(b) && webrtc::H264IsSameProfile(a.parameters,b.parameters);
