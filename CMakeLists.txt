@@ -58,6 +58,7 @@ target_include_directories(livekit_protocol PUBLIC "${CMAKE_CURRENT_BINARY_DIR}/
 target_link_libraries(livekit_protocol PUBLIC protobuf::libprotobuf)
 add_library(livekit_core STATIC src/auth/auth.cpp src/app/config.cpp src/turn/turn.cpp src/rtc/rtc.cpp src/diagnostics/codec_audit.cpp src/backends/webrtc/native_rtp.cpp src/backends/webrtc/native_send_transport.cpp src/sfu/sfu.cpp src/rooms/rooms.cpp src/rooms/rpc.cpp src/transport/http.cpp src/transport/join_request.cpp)
 target_sources(livekit_core PRIVATE src/transport/studio_admission.cpp)
+target_sources(livekit_core PRIVATE src/transport/twirp.cpp)
 if(WIN32)
   # The pinned manifest defaults to stdlib queues on every platform. Compile
   # and select libwebrtc's Windows timer implementation without changing it.
@@ -80,6 +81,10 @@ add_executable(livekit-server src/app/main.cpp)
 target_link_libraries(livekit-server PRIVATE livekit_core)
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(livekit-twirp-tests tests/unit/twirp_test.cpp)
+  target_link_libraries(livekit-twirp-tests PRIVATE livekit_core)
+  add_test(NAME twirp COMMAND livekit-twirp-tests)
+  set_tests_properties(twirp PROPERTIES TIMEOUT 30)
   add_executable(livekit-config-tests tests/unit/config_test.cpp)
   target_link_libraries(livekit-config-tests PRIVATE livekit_core)
   add_test(NAME config COMMAND livekit-config-tests)

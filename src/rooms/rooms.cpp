@@ -12,16 +12,19 @@ void require(bool ok) { if (!ok) throw Error(403, "permission_denied", "Permissi
 // signaling permission contract separate from the management API contract.
 void require_api(bool ok) { if (!ok) throw Error(401, "unauthenticated", "permissions denied"); }
 void name_limit(const std::string& s) { if (s.empty() || s.size() > 256) throw Error(400, "invalid_argument", "Name or identity must contain 1..256 bytes"); }
-void metadata_limit(const std::string& s) { if (s.size() > 512 * 1024) throw Error(400, "invalid_argument", "Metadata exceeds 512 KiB"); }
+void api_limit(size_t size, size_t limit, const std::string& argument) {
+  if (size > limit) throw Error(400, "invalid_argument", argument + " " + std::to_string(limit), {{"argument", argument}});
+}
+void metadata_limit(const std::string& s) { api_limit(s.size(), 512 * 1024, "metadata size exceeds limits"); }
 void attributes_limit(const google::protobuf::Map<std::string, std::string>& attrs) {
   size_t bytes = 0;
   for (const auto& [key, value] : attrs) bytes += key.size() + value.size();
-  if (bytes > 65536) throw Error(400, "invalid_argument", "Attributes exceed 64 KiB");
+  api_limit(bytes, 65536, "attribute size exceeds limits");
 }
 void attributes_limit(const Json& attrs) {
   size_t bytes = 0;
   for (const auto& item : attrs.items()) bytes += item.key().size() + item.value().get_ref<const std::string&>().size();
-  if (bytes > 65536) throw Error(400, "invalid_argument", "Attributes exceed 64 KiB");
+  api_limit(bytes, 65536, "attribute size exceeds limits");
 }
 bool valid_layers(const google::protobuf::RepeatedPtrField<livekit::VideoLayer>& layers) {
   if (layers.size()>3) return false;
@@ -43,17 +46,18 @@ void attributes(livekit::ParticipantInfo& info, const google::protobuf::Map<std:
 Rooms::Rooms(boost::asio::io_context& io, RtcRuntime& rtc, const Config& config) : io_(io), rtc_(rtc), config_(config), timer_(io), rpc_(io) { tick(); }
 Rooms::~Rooms() { shutdown(); }
 Room& Rooms::room(const std::string& name) {
-  auto it = rooms_.find(name); if (it == rooms_.end()) throw Error(404, "not_found", "Room not found"); return it->second;
+  auto it = rooms_.find(name); if (it == rooms_.end()) throw Error(404, "not_found", "requested room does not exist"); return it->second;
 }
 std::shared_ptr<Participant> Rooms::participant(Room& room, const std::string& identity) {
-  auto it = room.participants.find(identity); if (it == room.participants.end()) throw Error(404, "not_found", "Participant not found"); return it->second;
+  auto it = room.participants.find(identity); if (it == room.participants.end()) throw Error(404, "not_found", "participant does not exist"); return it->second;
 }
 Room& Rooms::create(const livekit::CreateRoomRequest& req) {
   // The pinned Go CreateRoom API accepts an empty name; the RTC join path
   // separately requires a non-empty room and identity.
-  if (req.name().size() > 256) throw Error(400, "invalid_argument", "Room name exceeds 256 bytes");
+  if (req.name().size() > 256) throw Error(400, "invalid_argument", "room name length exceeds limits: max length 256");
   metadata_limit(req.metadata());
-  if (req.has_egress() || !req.agents().empty() || !req.room_preset().empty()) throw Error(501, "unimplemented", "Egress, agents and room presets are not supported");
+  if (!req.room_preset().empty()) throw Error(400, "invalid_argument", "unknown room configuration in create room request");
+  if (req.has_egress() || !req.agents().empty()) throw Error(501, "unimplemented", "Egress and agents are not supported");
   auto [it, inserted] = rooms_.try_emplace(req.name());
   if (inserted) {
     auto& r = it->second.info;
@@ -381,6 +385,10 @@ void Rooms::route_data(Room& r, const std::shared_ptr<Participant>& sender, live
   if (sender && rpc_.receive(sender->info.sid(), packet)) return;
   packet.set_kind(reliable ? livekit::DataPacket::RELIABLE : livekit::DataPacket::LOSSY);
   normalize_data_destinations(packet);
+  // The receive side admits at most 64 KiB per encoded DataPacket. Do not put
+  // an undeliverable server API message at the head of a reliable queue, or
+  // interpret it as subscriber backpressure and disconnect the participant.
+  if (packet.ByteSizeLong() > 65536) return;
   if (packet.has_user() && r.user_packet_deduper.duplicate(packet.user().nonce())) return;
   for (auto& [identity, p] : r.participants) {
     if (p == sender || !data_destination_matches(packet, identity, p->info.sid())) continue;
@@ -514,6 +522,15 @@ Json Rooms::api(const std::string& method, const Json& json, const Claims& claim
     while (!r.participants.empty()) leave(r.participants.begin()->second, livekit::ROOM_DELETED);
     rooms_.erase(req.room()); return Json::object();
   }
+  // These two Go entry points validate bounds before checking the grant or
+  // looking up room/participant state. Rejected updates must have no effects.
+  if (method == "UpdateParticipant") {
+    auto req = from_json<livekit::UpdateParticipantRequest>(json);
+    api_limit(req.name().size(), 256, "name length exceeds limits");
+    metadata_limit(req.metadata()); attributes_limit(req.attributes());
+  } else if (method == "UpdateRoomMetadata") {
+    metadata_limit(from_json<livekit::UpdateRoomMetadataRequest>(json).metadata());
+  }
   auto name = json.value("room", ""); require_api(claims.admin && claims.room == name);
   if (method == "ListParticipants") {
     from_json<livekit::ListParticipantsRequest>(json); livekit::ListParticipantsResponse res;
@@ -538,14 +555,30 @@ Json Rooms::api(const std::string& method, const Json& json, const Claims& claim
     if (auto track = p->tracks.find(req.track_sid()); track != p->tracks.end()) *res.mutable_track() = track->second.info;
     return to_json(res);
   }
+  // Store-backed APIs report an absent participant even when its room is
+  // absent. Direct RPC APIs report an unavailable endpoint instead.
+  const auto found = rooms_.find(name);
+  if (method == "GetParticipant" || method == "RemoveParticipant" || method == "UpdateParticipant") {
+    if (found == rooms_.end() || !found->second.participants.contains(json.value("identity", "")))
+      throw Error(404, "not_found", "participant does not exist");
+  } else if (method == "UpdateSubscriptions") {
+    if (found == rooms_.end() || !found->second.participants.contains(json.value("identity", "")))
+      throw Error(503, "unavailable", "no response from servers");
+  } else if (method == "SendData") {
+    const auto req = from_json<livekit::SendDataRequest>(json);
+    if (!req.nonce().empty() && req.nonce().size() != 16)
+      throw Error(400, "invalid_argument", "nonce should be 16-bytes or not present, got: " + std::to_string(req.nonce().size()) + " bytes");
+    if (found == rooms_.end()) throw Error(503, "unavailable", "no response from servers");
+  }
   auto& r = room(name);
   if (method == "UpdateRoomMetadata") {
-    auto req = from_json<livekit::UpdateRoomMetadataRequest>(json); metadata_limit(req.metadata()); r.info.set_metadata(req.metadata());
+    auto req = from_json<livekit::UpdateRoomMetadataRequest>(json); r.info.set_metadata(req.metadata());
     livekit::SignalResponse res; *res.mutable_room_update()->mutable_room() = r.info; broadcast(r, res); return to_json(r.info);
   }
   if (method == "SendData") {
-    auto req = from_json<livekit::SendDataRequest>(json); if (req.data().size() > 60000) throw Error(400, "invalid_argument", "Data payload too large");
-    if (!req.nonce().empty() && req.nonce().size() != 16) throw Error(400, "invalid_argument", "nonce should be 16-bytes or not present");
+    // Like Go, API acceptance is independent of SCTP delivery. The transport
+    // keeps its own message/queue bounds; this is not a delivery receipt.
+    auto req = from_json<livekit::SendDataRequest>(json);
     livekit::DataPacket packet; auto* user = packet.mutable_user(); user->set_payload(req.data()); if (req.has_topic()) user->set_topic(req.topic()); user->set_nonce(req.nonce());
     *user->mutable_destination_sids() = req.destination_sids(); *packet.mutable_destination_identities() = req.destination_identities();
     route_data(r, nullptr, packet, req.kind() == livekit::DataPacket::RELIABLE); return Json::object();
@@ -558,7 +591,7 @@ Json Rooms::api(const std::string& method, const Json& json, const Claims& claim
     for (const auto& part : req.participant_tracks()) for (const auto& sid : part.track_sids()) subscribe(p, sid, req.subscribe()); return Json::object();
   }
   if (method == "UpdateParticipant") {
-    auto req = from_json<livekit::UpdateParticipantRequest>(json); metadata_limit(req.metadata()); attributes_limit(req.attributes());
+    auto req = from_json<livekit::UpdateParticipantRequest>(json);
     // The pinned Go manager applies metadata before changing permissions. In
     // particular, metadata supplied with visible->hidden is still broadcast
     // under the previous visibility; later hidden updates are self-only.

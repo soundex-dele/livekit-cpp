@@ -19,10 +19,11 @@ const deps = resolve(opts['node-modules'] || resolve(here, 'node_modules'));
 const require = createRequire(resolve(deps, '../package.json'));
 const { chromium } = require('playwright');
 const { AccessToken, RoomServiceClient } = require('livekit-server-sdk');
+const { UpdateParticipantRequest } = require('@livekit/protocol');
 const out = resolve(opts.output || resolve(here, 'results/go-participant-parity'),
   new Date().toISOString().replaceAll(/[:.]/g, '-') + '-' + randomBytes(3).toString('hex'));
 mkdirSync(out, { recursive: true });
-const report = { fullReplacementVerified: false, scope: 'hidden participants, kinds and dependent room lifecycle', servers: {}, comparisons: [] };
+const report = { fullReplacementVerified: false, scope: 'hidden participants, kinds, dependent room lifecycle and atomic API limit rejection with live media', servers: {}, comparisons: [] };
 const delay = ms => new Promise(r => setTimeout(r, ms));
 async function eventually(fn, label, timeout = 15000) {
   const end = Date.now() + timeout;
@@ -199,6 +200,25 @@ async function exercise(kind, binary) {
     await check('dynamic unhide broadcasts current state', async () => {
       await api.updateParticipant(roomName, 'dynamic', { permission: permission({ hidden: false }), metadata: 'public-update' });
       await eventually(() => observer.evaluate(() => room.remoteParticipants.get('dynamic')?.metadata === 'public-update'), 'visible metadata');
+    });
+    for (const binary of [false, true]) await check(`${binary ? 'protobuf' : 'json'} over-limit update preserves participant state and media`, async () => {
+      const before = await api.getParticipant(roomName, 'observer');
+      const admin = new AccessToken(key, secret); admin.addGrant({ room: roomName, roomAdmin: true });
+      const jwt = await admin.toJwt();
+      for (const invalid of [{ name: 'n'.repeat(257) }, { metadata: 'm'.repeat(524289) }, { attributes: { key: 'a'.repeat(65536) } }]) {
+        const payload = { room: roomName, identity: 'observer', name: 'must-not-apply', metadata: 'must-not-apply',
+          permission: { canPublish: false, canSubscribe: false, canPublishData: false }, ...invalid };
+        const response = await fetch(`${base}/twirp/livekit.RoomService/UpdateParticipant`, {
+          method: 'POST', headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': binary ? 'application/protobuf' : 'application/json' },
+          body: binary ? new UpdateParticipantRequest(payload).toBinary() : JSON.stringify(payload), signal: AbortSignal.timeout(10000),
+        });
+        assert.equal(response.status, 400); assert.equal((await response.json()).code, 'invalid_argument');
+        const after = await api.getParticipant(roomName, 'observer');
+        assert.deepEqual(after.toJson(), before.toJson(), 'Rejected update changed participant state/version');
+      }
+      assert.equal(await observer.evaluate(() => room.state), 'connected');
+      const tracks = before.tracks.filter(t => t.type === 1).map(t => t.sid);
+      assert.ok(tracks.length, 'Live publisher required for rejection test'); await media(late, tracks);
     });
     await api.deleteRoom(roomName);
     await closeContexts();

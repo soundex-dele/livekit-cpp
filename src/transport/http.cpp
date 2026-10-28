@@ -1,6 +1,7 @@
 #include "lk/http.hpp"
 #include "lk/join_request.hpp"
 #include "lk/studio_admission.hpp"
+#include "lk/twirp.hpp"
 #include <boost/beast.hpp>
 #include <google/protobuf/dynamic_message.h>
 #include <deque>
@@ -182,13 +183,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
     auto status = google::protobuf::util::JsonStringToMessage(output.dump(), proto.get());
     if (!status.ok()) throw std::runtime_error(status.ToString());
     if (binary) { respond(200, proto->SerializeAsString(), "application/protobuf"); return; }
-    google::protobuf::util::JsonPrintOptions options;
-    options.preserve_proto_field_names = true;
-    options.always_print_primitive_fields = true;
-    std::string body;
-    status = google::protobuf::util::MessageToJsonString(*proto, &body, options);
-    if (!status.ok()) throw std::runtime_error(status.ToString());
-    respond(200, std::move(body));
+    respond(200, print_twirp_json(*proto));
   }
   void watch_rpc_client() {
     stream_.socket().async_read_some(boost::asio::buffer(rpc_read_buffer_),
@@ -286,26 +281,31 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
       }
       const std::string prefix = "/twirp/livekit.RoomService/";
       if (!target.path.starts_with(prefix)) throw Error(404, "bad_route", "Route not found");
-      if (request.method() != http::verb::post) throw Error(405, "bad_route", "POST required");
-      auto claims = authenticate(request, target, auth_); auto method = target.path.substr(prefix.size());
+      // An absent token reaches the Go handler with no grants. In particular,
+      // malformed input and routing errors are evaluated before API grants.
+      Claims claims;
+      if (!request[http::field::authorization].empty() || target.query.contains("access_token"))
+        claims = authenticate(request, target, auth_);
+      if (request.method() != http::verb::post) throw Error(404, "bad_route", "POST required");
+      auto method = target.path.substr(prefix.size());
       auto* service = google::protobuf::DescriptorPool::generated_pool()->FindServiceByName("livekit.RoomService");
       auto* descriptor = service ? service->FindMethodByName(method) : nullptr;
       if (!descriptor) throw Error(404, "bad_route", "Unknown RoomService method");
       google::protobuf::DynamicMessageFactory factory;
-      bool binary = std::string(request[http::field::content_type]).starts_with("application/protobuf");
+      auto media_type = std::string(request[http::field::content_type]);
+      media_type = media_type.substr(0, media_type.find(';'));
+      while (!media_type.empty() && media_type.back() == ' ') media_type.pop_back();
+      bool binary = media_type == "application/protobuf";
       std::unique_ptr<google::protobuf::Message> input_proto(factory.GetPrototype(descriptor->input_type())->New());
       if (binary) {
         if (!input_proto->ParseFromString(request.body())) throw Error(400, "malformed", "Invalid protobuf request");
       } else {
-        if (!std::string(request[http::field::content_type]).starts_with("application/json")) throw Error(415, "bad_route", "Use application/json or application/protobuf");
+        if (media_type != "application/json") throw Error(404, "bad_route", "Use application/json or application/protobuf");
         // Twirp's Go JSON decoder discards unknown fields and accepts proto
         // field names as well as lowerCamelCase. Normalize once so both wire
         // formats reach the same API validation, with malformed type errors
         // reported before permission and room-state checks.
-        google::protobuf::util::JsonParseOptions options;
-        options.ignore_unknown_fields = true;
-        auto status = google::protobuf::util::JsonStringToMessage(request.body(), input_proto.get(), options);
-        if (!status.ok()) throw Error(400, "malformed", "Invalid JSON request");
+        parse_twirp_json(request.body(), *input_proto);
       }
       if (method == "PerformRpc" || method == "ForwardParticipant" || method == "MoveParticipant") {
         participant_api(method, to_json(*input_proto), claims,

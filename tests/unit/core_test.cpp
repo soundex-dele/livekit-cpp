@@ -209,6 +209,13 @@ int main() {
     rejected([&] { rooms.api("UpdateParticipant", participant_update, admin); }, 400);
     check(p->info.metadata() == large_metadata && p->info.attributes().at("k") == attribute_value,
           "Rejected attribute update partially changed participant state");
+    participant_update["attributes"].clear();
+    participant_update["name"] = std::string(257, 'n');
+    rejected([&] { rooms.api("UpdateParticipant", participant_update, admin); }, 400);
+    check(p->info.metadata() == large_metadata, "Rejected participant name partially applied metadata");
+    livekit::SendDataRequest oversized; oversized.set_room("demo"); oversized.set_data(std::string(2 * 1024 * 1024, 'x'));
+    rooms.api("SendData", lk::to_json(oversized), admin); io.poll();
+    check(!p->closed, "Oversized API data disconnected subscriber");
     auto replacement_sink = std::make_shared<Sink>(); auto replacement = rooms.join(claims, true, replacement_sink);
     check(p->closed && sink->closed && replacement->info.sid() != p->info.sid(), "Duplicate identity not replaced");
     check(replacement_sink->messages.front().join().ice_servers(0).username()!=join_ice[0].username(),
