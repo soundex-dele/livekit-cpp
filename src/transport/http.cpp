@@ -56,8 +56,10 @@ class WebSocketSession : public SignalSink, public std::enable_shared_from_this<
  public:
   WebSocketSession(beast::tcp_stream stream, Rooms& rooms, std::shared_ptr<ConnectionCount> count)
       : socket_(std::move(stream)), rooms_(rooms), count_(std::move(count)) {}
-  void run(Request request, Claims claims, bool auto_subscribe, bool reconnect, std::optional<livekit::JoinRequest> join_request) {
+  void run(Request request, Claims claims, bool auto_subscribe, bool reconnect, std::optional<livekit::JoinRequest> join_request,
+           livekit::ClientInfo client_info) {
     request_ = std::move(request); claims_ = std::move(claims); join_request_ = std::move(join_request);
+    client_info_ = std::move(client_info);
     beast::get_lowest_layer(socket_).expires_never();
     socket_.set_option(ws::stream_base::timeout::suggested(beast::role_type::server));
     socket_.read_message_max(2 * 1024 * 1024);
@@ -71,7 +73,7 @@ class WebSocketSession : public SignalSink, public std::enable_shared_from_this<
             self->send(response); self->close(); return;
           }
         } else {
-          self->participant_ = self->rooms_.join(self->claims_, auto_subscribe, self, self->join_request_ ? std::max(0, self->join_request_->client_info().protocol()) : -1);
+          self->participant_ = self->rooms_.join(self->claims_, auto_subscribe, self, self->join_request_ ? std::max(0, self->join_request_->client_info().protocol()) : -1, self->client_info_);
         }
         if (self->join_request_) {
           livekit::SignalRequest message;
@@ -145,6 +147,7 @@ class WebSocketSession : public SignalSink, public std::enable_shared_from_this<
   std::shared_ptr<ConnectionCount> count_;
   Request request_;
   Claims claims_;
+  livekit::ClientInfo client_info_;
   std::optional<livekit::JoinRequest> join_request_;
   std::shared_ptr<Participant> participant_;
   beast::flat_buffer buffer_;
@@ -271,7 +274,8 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
         bool auto_subscribe = !target.query.contains("auto_subscribe") || target.query["auto_subscribe"] != "0";
         bool reconnect = target.query.contains("reconnect") && target.query["reconnect"] == "1";
         if (join_request) { auto_subscribe = join_request->connection_settings().auto_subscribe(); reconnect = join_request->reconnect(); }
-        session->run(std::move(request), std::move(claims), auto_subscribe, reconnect, std::move(join_request)); return;
+        auto client_info = join_request ? join_request->client_info() : parse_client_info(target.query);
+        session->run(std::move(request), std::move(claims), auto_subscribe, reconnect, std::move(join_request), std::move(client_info)); return;
       }
       if (target.path == "/metrics") {
         auto c = authenticate(request, target, auth_); if (!c.list) throw Error(403, "permission_denied", "roomList required");

@@ -2,8 +2,36 @@
 #include <openssl/evp.h>
 #include <zlib.h>
 #include <array>
+#include <charconv>
 
 namespace lk {
+livekit::ClientInfo parse_client_info(const std::map<std::string, std::string>& query) {
+  auto get = [&](const std::string& name) -> std::string {
+    const auto it = query.find(name); return it == query.end() ? "" : it->second;
+  };
+  auto integer = [&](const std::string& name) {
+    const auto text = get(name); const char* begin = text.data();
+    if (!text.empty() && text.front() == '+') {
+      ++begin;
+      if (begin == text.data() + text.size() || *begin < '0' || *begin > '9') return int32_t(0);
+    }
+    int32_t value = 0;
+    auto result = std::from_chars(begin, text.data() + text.size(), value);
+    return result.ec == std::errc{} && result.ptr == text.data() + text.size() ? value : int32_t(0);
+  };
+  livekit::ClientInfo info; info.set_protocol(integer("protocol")); info.set_client_protocol(integer("client_protocol"));
+  static const std::map<std::string, livekit::ClientInfo::SDK> sdks{
+    {"js", livekit::ClientInfo::JS}, {"ios", livekit::ClientInfo::SWIFT}, {"swift", livekit::ClientInfo::SWIFT},
+    {"android", livekit::ClientInfo::ANDROID}, {"flutter", livekit::ClientInfo::FLUTTER}, {"go", livekit::ClientInfo::GO},
+    {"unity", livekit::ClientInfo::UNITY}, {"reactnative", livekit::ClientInfo::REACT_NATIVE}, {"rust", livekit::ClientInfo::RUST},
+    {"python", livekit::ClientInfo::PYTHON}, {"cpp", livekit::ClientInfo::CPP}, {"unityweb", livekit::ClientInfo::UNITY_WEB},
+    {"node", livekit::ClientInfo::NODE}, {"esp32", livekit::ClientInfo::ESP32}};
+  if (const auto it = sdks.find(get("sdk")); it != sdks.end()) info.set_sdk(it->second);
+  info.set_version(get("version")); info.set_os(get("os")); info.set_os_version(get("os_version"));
+  info.set_browser(get("browser")); info.set_browser_version(get("browser_version"));
+  info.set_device_model(get("device_model")); info.set_network(get("network"));
+  return info;
+}
 livekit::JoinRequest decode_join_request(const std::string& encoded) {
   constexpr size_t limit = 1024 * 1024;
   auto reject = [](const char* message) { throw Error(400, "invalid_argument", message); };

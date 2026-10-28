@@ -38,6 +38,7 @@ struct Participant {
   std::map<std::string, VideoSubscription> track_settings;
   bool auto_subscribe = true, closed = false, ice_connected = false;
   int single_pc_protocol = -1;
+  livekit::ClientInfo client_info;
   struct CachedUpdate { livekit::ParticipantInfo info; int64_t at; uint64_t order; };
   std::map<std::string, CachedUpdate> update_cache;
   uint64_t update_order = 0;
@@ -46,6 +47,12 @@ struct Participant {
   uint32_t last_published_data_sequence = 0;
   uint32_t last_rtt_ms = 0;
   void send(const livekit::SignalResponse& response) {
+    // Old Rust clients cannot decode these variants; pre-v15 clients expect
+    // only error RequestResponses. Keep capability gating in one place.
+    if ((response.has_request_response() || response.has_track_subscribed()) &&
+        client_info.sdk() == livekit::ClientInfo::RUST && client_info.protocol() < 10) return;
+    if (response.has_request_response() && response.request_response().reason() == livekit::RequestResponse::OK &&
+        client_info.protocol() <= 14) return;
     if (response.has_update()) for (const auto& info : response.update().participants()) {
       auto& cached = update_cache[info.sid()];
       // Resume only needs tombstone identity/version. Do not retain copies of
@@ -73,7 +80,8 @@ class Rooms {
  public:
   Rooms(boost::asio::io_context&, RtcRuntime&, const Config&);
   ~Rooms();
-  std::shared_ptr<Participant> join(const Claims&, bool auto_subscribe, std::shared_ptr<SignalSink>, int single_pc_protocol = -1);
+  std::shared_ptr<Participant> join(const Claims&, bool auto_subscribe, std::shared_ptr<SignalSink>, int single_pc_protocol = -1,
+                                    const livekit::ClientInfo& = {});
   std::shared_ptr<Participant> resume(const Claims&, std::shared_ptr<SignalSink>);
   void signal_closed(const std::shared_ptr<Participant>&, const SignalSink*);
   void signal(const std::shared_ptr<Participant>&, const livekit::SignalRequest&);

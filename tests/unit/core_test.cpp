@@ -216,6 +216,39 @@ int main() {
     livekit::SendDataRequest oversized; oversized.set_room("demo"); oversized.set_data(std::string(2 * 1024 * 1024, 'x'));
     rooms.api("SendData", lk::to_json(oversized), admin); io.poll();
     check(!p->closed, "Oversized API data disconnected subscriber");
+    // A rejected self-update must reply with the original request and leave
+    // both state and session alive, even when another supplied field is valid.
+    p->client_info.set_protocol(15); p->client_info.set_sdk(livekit::ClientInfo::JS);
+    p->claims.update_metadata = true;
+    const auto unchanged = p->info.SerializeAsString();
+    auto self_rejected = [&](const lk::Json& payload, const std::string& message, livekit::RequestResponse::Reason reason = livekit::RequestResponse::LIMIT_EXCEEDED) {
+      livekit::SignalRequest request;
+      *request.mutable_update_metadata() = lk::from_json<livekit::UpdateParticipantMetadata>(payload);
+      request.mutable_update_metadata()->set_request_id(44);
+      const auto count = sink->messages.size(); rooms.signal(p, request);
+      check(!p->closed && !sink->closed && p->info.SerializeAsString() == unchanged, "Rejected self-update changed state or closed session");
+      check(sink->messages.size() == count + 1, "Rejected self-update emitted state changes or token refresh");
+      const auto& response = sink->messages.back().request_response();
+      check(response.request_id() == 44 && response.reason() == reason && response.message() == message &&
+            response.update_metadata().SerializeAsString() == request.update_metadata().SerializeAsString(), "Self-update response contract differs");
+    };
+    self_rejected({{"name", std::string(257, 'x')}, {"metadata", "must-not-apply"}}, "exceeds name length limit");
+    self_rejected({{"name", "must-not-apply"}, {"metadata", std::string(524289, 'x')}}, "exceeds metadata size limit");
+    self_rejected({{"attributes", {{"k", std::string(65536, 'x')}}}}, "exceeds attributes size limit");
+    p->claims.update_metadata = false;
+    self_rejected({{"name", std::string(257, 'x')}}, "does not have permission to update own metadata", livekit::RequestResponse::NOT_ALLOWED);
+    p->claims.update_metadata = true;
+    request.Clear(); request.mutable_update_metadata()->set_name("valid-after-errors"); rooms.signal(p, request);
+    check(p->info.name() == "valid-after-errors" && sink->messages.back().request_response().reason() == livekit::RequestResponse::OK, "Valid self-update did not recover");
+    auto legacy_sink = std::make_shared<Sink>(); lk::Participant legacy; legacy.sink = legacy_sink;
+    livekit::SignalResponse response; response.mutable_request_response()->set_reason(livekit::RequestResponse::OK);
+    legacy.client_info.set_protocol(14); legacy.send(response); check(legacy_sink->messages.empty(), "Pre-v15 client received success response");
+    response.mutable_request_response()->set_reason(livekit::RequestResponse::NOT_ALLOWED); legacy.send(response);
+    check(legacy_sink->messages.size() == 1, "Pre-v15 client lost error response");
+    legacy.client_info.set_sdk(livekit::ClientInfo::RUST); legacy.client_info.set_protocol(9); legacy.send(response);
+    response.Clear(); response.mutable_track_subscribed()->set_track_sid("track"); legacy.send(response);
+    check(legacy_sink->messages.size() == 1, "Old Rust client received unknown response variant");
+    legacy.client_info.set_protocol(10); legacy.send(response); check(legacy_sink->messages.size() == 2, "Modern Rust client lost supported event");
     auto replacement_sink = std::make_shared<Sink>(); auto replacement = rooms.join(claims, true, replacement_sink);
     check(p->closed && sink->closed && replacement->info.sid() != p->info.sid(), "Duplicate identity not replaced");
     check(replacement_sink->messages.front().join().ice_servers(0).username()!=join_ice[0].username(),

@@ -36,6 +36,13 @@ void rejected(const std::string& encoded) {
 }
 int main() {
   try {
+    auto info = lk::parse_client_info({{"sdk", "rust"}, {"protocol", "+15"}, {"client_protocol", "2"}, {"version", "0.1"}});
+    check(info.sdk() == livekit::ClientInfo::RUST && info.protocol() == 15 && info.client_protocol() == 2 && info.version() == "0.1", "legacy client info not parsed");
+    for (const auto* text : {"", "15x", " 15", "2147483648", "+-15", "+"})
+      check(lk::parse_client_info({{"protocol", text}}).protocol() == 0, "invalid protocol did not use zero default");
+    check(lk::parse_client_info({{"sdk", "Rust"}, {"protocol", "-1"}}).sdk() == livekit::ClientInfo::UNKNOWN &&
+          lk::parse_client_info({{"protocol", "-1"}}).protocol() == -1, "client info normalization differs from Go");
+    check(lk::parse_client_info({{"sdk", "ios"}}).sdk() == livekit::ClientInfo::SWIFT, "legacy SDK alias missing");
     livekit::JoinRequest join; join.set_metadata("metadata"); join.mutable_client_info()->set_protocol(18);
     (*join.mutable_participant_attributes())["a"] = "b";
     auto bytes = join.SerializeAsString();

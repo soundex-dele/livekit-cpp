@@ -114,7 +114,8 @@ void Rooms::update_metadata(const std::shared_ptr<Participant>& p, const std::st
     updated(p); refresh_token(p);
   }
 }
-std::shared_ptr<Participant> Rooms::join(const Claims& claims, bool auto_subscribe, std::shared_ptr<SignalSink> sink, int single_pc_protocol) {
+std::shared_ptr<Participant> Rooms::join(const Claims& claims, bool auto_subscribe, std::shared_ptr<SignalSink> sink, int single_pc_protocol,
+                                      const livekit::ClientInfo& client_info) {
   require(claims.join); name_limit(claims.room); name_limit(claims.identity); metadata_limit(claims.metadata); attributes_limit(claims.attributes);
   if (stopping_) throw Error(503, "unavailable", "Server is stopping");
   livekit::CreateRoomRequest create_req; create_req.set_name(claims.room);
@@ -123,6 +124,7 @@ std::shared_ptr<Participant> Rooms::join(const Claims& claims, bool auto_subscri
   if (!claims.is_dependent() && r.info.max_participants() && r.info.num_participants() >= r.info.max_participants())
     throw Error(429, "resource_exhausted", "Room is full");
   auto p = std::make_shared<Participant>(); p->claims = claims; p->sink = sink; p->auto_subscribe = auto_subscribe; p->single_pc_protocol = single_pc_protocol;
+  p->client_info = client_info;
   p->info.set_sid(random_id("PA_")); p->info.set_identity(claims.identity); p->info.set_name(claims.name); p->info.set_metadata(claims.metadata);
   p->info.set_joined_at(now_ms() / 1000); p->info.set_joined_at_ms(now_ms()); p->info.set_state(livekit::ParticipantInfo::JOINED); p->info.set_version(1);
   for (const auto& item : claims.attributes.items()) (*p->info.mutable_attributes())[item.key()] = item.value().get<std::string>();
@@ -473,8 +475,24 @@ void Rooms::signal(const std::shared_ptr<Participant>& p, const livekit::SignalR
       } break;
     case livekit::SignalRequest::kUpdateMetadata: {
       auto* response = res.mutable_request_response(); response->set_request_id(req.update_metadata().request_id()); *response->mutable_update_metadata() = req.update_metadata();
-      if (!p->claims.update_metadata) { response->set_reason(livekit::RequestResponse::NOT_ALLOWED); p->send(res); break; }
-      metadata_limit(req.update_metadata().metadata()); attributes_limit(req.update_metadata().attributes());
+      if (!p->claims.update_metadata) {
+        response->set_reason(livekit::RequestResponse::NOT_ALLOWED);
+        response->set_message("does not have permission to update own metadata"); p->send(res); break;
+      }
+      // Invalid self-updates are recoverable signaling requests, not transport
+      // failures. Validate every field before applying any claims or metadata.
+      std::string limit_error;
+      if (req.update_metadata().name().size() > 256) limit_error = "exceeds name length limit";
+      else if (req.update_metadata().metadata().size() > 512 * 1024) limit_error = "exceeds metadata size limit";
+      else {
+        size_t bytes = 0;
+        for (const auto& [key, value] : req.update_metadata().attributes()) bytes += key.size() + value.size();
+        if (bytes > 65536) limit_error = "exceeds attributes size limit";
+      }
+      if (!limit_error.empty()) {
+        response->set_reason(livekit::RequestResponse::LIMIT_EXCEEDED);
+        response->set_message(limit_error); p->send(res); break;
+      }
       update_metadata(p, req.update_metadata().name(), req.update_metadata().metadata(), req.update_metadata().attributes());
       response->set_reason(livekit::RequestResponse::OK); p->send(res); break;
     }
