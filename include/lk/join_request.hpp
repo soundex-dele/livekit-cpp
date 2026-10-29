@@ -11,4 +11,4 @@ namespace lk {
 livekit::JoinRequest decode_join_request(const std::string& encoded);
 // Legacy /rtc identifies its signaling capabilities in query parameters.
 livekit::ClientInfo parse_client_info(const std::map<std::string, std::string>& query);
-}
+}  // namespace lk

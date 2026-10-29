@@ -16,11 +16,14 @@ void TurnRestAuth::validate() const {
   for (const auto& url : urls) {
     if (url.size() > 2048 || (!url.starts_with("turn:") && !url.starts_with("turns:")) ||
         url.find_first_of("\r\n\t @") != std::string::npos)
-      throw std::runtime_error("rtc.turn_rest requires turn: or turns: URLs without embedded credentials");
+      throw std::runtime_error(
+          "rtc.turn_rest requires turn: or turns: URLs without embedded credentials");
   }
   // Reuse native WebRTC URI/transport validation rather than a second parser.
   webrtc::PeerConnectionInterface::IceServer server;
-  server.urls = urls; server.username = "validation"; server.password = "validation";
+  server.urls = urls;
+  server.username = "validation";
+  server.password = "validation";
   webrtc::ServerAddresses stun;
   std::vector<webrtc::RelayServerConfig> turn;
   if (!webrtc::ParseIceServersOrError({server}, &stun, &turn).ok() || !stun.empty() || turn.empty())
@@ -30,7 +33,8 @@ void TurnRestAuth::validate() const {
 IceServer TurnRestAuth::issue(const std::string& session_id, int64_t now) const {
   validate();
   if (session_id.empty() || session_id.size() > 128 ||
-      session_id.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") != std::string::npos)
+      session_id.find_first_not_of(
+          "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") != std::string::npos)
     throw std::runtime_error("Invalid TURN session identifier");
   if (now < 0 || now > std::numeric_limits<int64_t>::max() - credential_ttl_seconds)
     throw std::runtime_error("Invalid TURN credential issue time");
@@ -40,18 +44,23 @@ IceServer TurnRestAuth::issue(const std::string& session_id, int64_t now) const 
   // coturn REST authentication specifies Base64(HMAC-SHA1(secret, username)).
   // SHA-1 here is protocol-required HMAC, not a replacement for WebRTC crypto.
   if (!HMAC(EVP_sha1(), shared_secret.data(), static_cast<int>(shared_secret.size()),
-            reinterpret_cast<const unsigned char*>(result.username.data()), result.username.size(), digest.data(), &size))
+            reinterpret_cast<const unsigned char*>(result.username.data()), result.username.size(),
+            digest.data(), &size))
     throw std::runtime_error("TURN credential signing failed");
   std::array<unsigned char, 4 * ((EVP_MAX_MD_SIZE + 2) / 3) + 1> encoded{};
   int length = EVP_EncodeBlock(encoded.data(), digest.data(), static_cast<int>(size));
-  if (length < 0) throw std::runtime_error("TURN credential encoding failed");
-  result.credential.assign(reinterpret_cast<const char*>(encoded.data()), static_cast<size_t>(length));
+  if (length < 0)
+    throw std::runtime_error("TURN credential encoding failed");
+  result.credential.assign(reinterpret_cast<const char*>(encoded.data()),
+                           static_cast<size_t>(length));
   return result;
 }
 
-std::vector<IceServer> Config::session_ice_servers(const std::string& session_id, int64_t now) const {
+std::vector<IceServer> Config::session_ice_servers(const std::string& session_id,
+                                                   int64_t now) const {
   auto result = ice_servers;
-  if (turn_rest) result.push_back(turn_rest->issue(session_id, now));
+  if (turn_rest)
+    result.push_back(turn_rest->issue(session_id, now));
   return result;
 }
-}
+}  // namespace lk
