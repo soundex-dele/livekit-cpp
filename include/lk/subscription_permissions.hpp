@@ -44,7 +44,7 @@ class SubscriptionPermissions {
     if (all_)
       return true;
     auto it = entries_.find(identity);
-    return it != entries_.end() && (it->second.all || it->second.tracks.contains(track));
+    return it != entries_.end() && (it->second.all || it->second.tracks.count(track));
   }
 
  private:

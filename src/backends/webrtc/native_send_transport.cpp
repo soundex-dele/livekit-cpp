@@ -204,7 +204,7 @@ NativeSendTransport::NativeSendTransport(const webrtc::Environment& env, size_t 
 NativeSendTransport::~NativeSendTransport() = default;
 
 void NativeSendTransport::attach(uint32_t ssrc, std::optional<uint32_t> rtx, Stream stream) {
-  if (impl_->primary.contains(ssrc) || (rtx && impl_->primary.contains(*rtx)))
+  if (impl_->primary.count(ssrc) || (rtx && impl_->primary.count(*rtx)))
     throw std::invalid_argument("Duplicate sender SSRC");
   impl_->streams.emplace(ssrc, std::move(stream));
   impl_->primary[ssrc] = ssrc;

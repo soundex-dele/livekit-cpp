@@ -241,7 +241,7 @@ std::string Auth::refresh(const Claims& c, int64_t now) const {
                         {"gcp", "credentials"},
                         {"azure", "accountKey"},
                         {"aliOSS", "secret"}})
-        if (output.contains(pair.first) &&
+        if (output.count(pair.first) &&
             !output[pair.first].value(pair.second, std::string()).empty())
           return true;
       return false;
@@ -254,11 +254,11 @@ std::string Auth::refresh(const Claims& c, int64_t now) const {
         if (egress.contains(type)) {
           const auto& output = egress[type];
           for (auto field : {"fileOutputs", "segmentOutputs"})
-            if (output.contains(field))
+            if (output.count(field))
               for (const auto& file : output[field])
                 if (credentials(file))
                   throw std::runtime_error("Room output contains credentials");
-          if (std::string(type) == "room" && output.contains("streamOutputs") &&
+          if (std::string(type) == "room" && output.count("streamOutputs") &&
               !output["streamOutputs"].empty())
             throw std::runtime_error("Room output contains stream keys");
         }

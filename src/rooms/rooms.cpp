@@ -380,8 +380,8 @@ std::shared_ptr<Participant> Rooms::join(const Claims& claims, bool auto_subscri
                 }
               for (auto& [_, other] : room(p->claims.room).participants)
                 if (other != p && other->claims.subscribe &&
-                    (other->subscriptions.contains(sid) ? other->subscriptions.at(sid)
-                                                        : other->auto_subscribe))
+                    (other->subscriptions.count(sid) ? other->subscriptions.at(sid)
+                                                     : other->auto_subscribe))
                   subscribe(other, sid, true);
               updated(p);
               break;
@@ -597,8 +597,7 @@ void Rooms::received_track(const std::shared_ptr<Participant>& p, Track track,
       updated(p);
       for (const auto& [_, other] : room(p->claims.room).participants)
         if (other != p && other->claims.subscribe &&
-            (other->subscriptions.contains(sid) ? other->subscriptions[sid]
-                                                : other->auto_subscribe))
+            (other->subscriptions.count(sid) ? other->subscriptions[sid] : other->auto_subscribe))
           subscribe(other, sid, true);
       return;
     }
@@ -632,7 +631,7 @@ void Rooms::received_track(const std::shared_ptr<Participant>& p, Track track,
     for (auto& [_, other] : room(p->claims.room).participants)
       if (other != p && other->claims.subscribe) {
         bool desired =
-            other->subscriptions.contains(sid) ? other->subscriptions[sid] : other->auto_subscribe;
+            other->subscriptions.count(sid) ? other->subscriptions[sid] : other->auto_subscribe;
         if (desired)
           subscribe(other, sid, true);
       }
@@ -726,8 +725,7 @@ void Rooms::subscribe(const std::shared_ptr<Participant>& p, const std::string& 
       p->subscriber->add_track(sid, other->info.sid(), media, codec, variants);
       if (auto settings = p->track_settings.find(sid); settings != p->track_settings.end())
         p->subscriber->track_settings(sid, settings->second);
-      p->subscriber->enable_track(sid,
-                                  !t->second.info.muted() && !p->disabled_tracks.contains(sid));
+      p->subscriber->enable_track(sid, !t->second.info.muted() && !p->disabled_tracks.count(sid));
       return;
     }
 }
@@ -749,7 +747,7 @@ void Rooms::update_subscription_permissions(const std::shared_ptr<Participant>& 
     if (p != publisher && p->claims.subscribe) {
       for (const auto& [sid, track] : publisher->tracks) {
         const bool desired =
-            p->subscriptions.contains(sid) ? p->subscriptions[sid] : p->auto_subscribe;
+            p->subscriptions.count(sid) ? p->subscriptions[sid] : p->auto_subscribe;
         if (desired)
           subscribe(p, sid, true);
       }
@@ -762,7 +760,7 @@ void Rooms::subscriptions_ready(const std::shared_ptr<Participant>& subscriber) 
   for (auto& [_, publisher] : room(subscriber->claims.room).participants)
     if (publisher != subscriber) {
       for (auto& [sid, track] : publisher->tracks) {
-        if (track.subscribed_once || !track.media || !subscriber->subscriptions.contains(sid) ||
+        if (track.subscribed_once || !track.media || !subscriber->subscriptions.count(sid) ||
             !subscriber->subscriptions[sid])
           continue;
         if (!subscriber->claims.is_recorder() &&
@@ -783,7 +781,7 @@ void Rooms::mute(const std::shared_ptr<Participant>& p, const std::string& sid, 
   it->second.info.set_muted(muted);
   for (auto& [_, other] : room(p->claims.room).participants)
     if (other != p)
-      other->subscriber->enable_track(sid, !muted && !other->disabled_tracks.contains(sid));
+      other->subscriber->enable_track(sid, !muted && !other->disabled_tracks.count(sid));
   updated(p);
 }
 
@@ -896,13 +894,13 @@ void Rooms::signal(const std::shared_ptr<Participant>& p, const livekit::SignalR
         if (a.cid() == track.cid || a.type() != livekit::VIDEO)
           throw Error(400, "invalid_argument", "Invalid backup publication identity");
         for (const auto& [other_sid, other] : p->tracks)
-          if (other_sid != a.sid() && (other.cid == a.cid() || other.variants.contains(a.cid())))
+          if (other_sid != a.sid() && (other.cid == a.cid() || other.variants.count(a.cid())))
             throw Error(400, "invalid_argument", "Backup CID already in use");
         const auto& input = a.simulcast_codecs(0);
         auto name = codec_name(input.codec());
         if (name != "vp8" && name != "vp9" && name != "av1" && name != "h264" && name != "h265")
           throw Error(400, "invalid_argument", "Unsupported backup codec");
-        if (!track.variants.contains(a.cid()) && track.variants.size() >= 2)
+        if (!track.variants.count(a.cid()) && track.variants.size() >= 2)
           throw Error(400, "invalid_argument", "Too many backup codecs");
         track.variants.try_emplace(a.cid());
         livekit::SimulcastCodecInfo* codec = nullptr;
@@ -1062,7 +1060,7 @@ void Rooms::signal(const std::shared_ptr<Participant>& p, const livekit::SignalR
       for (const auto& sid : req.track_setting().track_sids()) {
         bool exists = false;
         for (const auto& [_, publisher] : room(p->claims.room).participants)
-          if (publisher != p && publisher->tracks.contains(sid)) {
+          if (publisher != p && publisher->tracks.count(sid)) {
             exists = true;
             break;
           }
@@ -1078,7 +1076,7 @@ void Rooms::signal(const std::shared_ptr<Participant>& p, const livekit::SignalR
           p->subscriber->enable_track(sid, false);
         } else {
           p->disabled_tracks.erase(sid);
-          if (p->subscriptions.contains(sid) && p->subscriptions[sid])
+          if (p->subscriptions.count(sid) && p->subscriptions[sid])
             subscribe(p, sid, true);
         }
       }
@@ -1124,7 +1122,7 @@ void Rooms::signal(const std::shared_ptr<Participant>& p, const livekit::SignalR
     case livekit::SignalRequest::kSyncState: {
       const auto& state = req.sync_state();
       for (const auto& published : state.publish_tracks())
-        if (!published.has_track() || !p->tracks.contains(published.track().sid())) {
+        if (!published.has_track() || !p->tracks.count(published.track().sid())) {
           leave(p, livekit::STATE_MISMATCH, true);
           return;
         }
@@ -1137,7 +1135,7 @@ void Rooms::signal(const std::shared_ptr<Participant>& p, const livekit::SignalR
       for (const auto& sid : state.track_sids_disabled()) {
         const auto& participants = room(p->claims.room).participants;
         if (std::any_of(participants.begin(), participants.end(), [&](const auto& entry) {
-              return entry.second != p && entry.second->tracks.contains(sid);
+              return entry.second != p && entry.second->tracks.count(sid);
             })) {
           p->disabled_tracks.insert(sid);
           p->subscriber->enable_track(sid, false);
@@ -1181,8 +1179,8 @@ void Rooms::signal(const std::shared_ptr<Participant>& p, const livekit::SignalR
         track.info.clear_audio_features();
         for (int feature : unique)
           track.info.add_audio_features(static_cast<livekit::AudioTrackFeature>(feature));
-        track.info.set_stereo(unique.contains(livekit::TF_STEREO));
-        track.info.set_disable_dtx(unique.contains(livekit::TF_NO_DTX));
+        track.info.set_stereo(unique.count(livekit::TF_STEREO));
+        track.info.set_disable_dtx(unique.count(livekit::TF_NO_DTX));
       } else if (!audio && (!track.media || track.info.type() == livekit::VIDEO)) {
         track.info.set_width(req.update_video_track().width());
         track.info.set_height(req.update_video_track().height());
@@ -1205,7 +1203,7 @@ Json Rooms::api(const std::string& method, const Json& json, const Claims& claim
       "CreateRoom",          "ListRooms",         "DeleteRoom",         "ListParticipants",
       "GetParticipant",      "RemoveParticipant", "MutePublishedTrack", "UpdateParticipant",
       "UpdateSubscriptions", "SendData",          "UpdateRoomMetadata"};
-  if (!supported.contains(method))
+  if (!supported.count(method))
     throw Error(501, "unimplemented", "RoomService method is not implemented");
   if (method == "CreateRoom") {
     require_api(claims.create);
@@ -1256,7 +1254,7 @@ Json Rooms::api(const std::string& method, const Json& json, const Claims& claim
     auto found = rooms_.find(name);
     // Go routes this method directly to the participant RPC endpoint. An
     // absent endpoint yields unavailable, before the room's unmute policy.
-    if (found == rooms_.end() || !found->second.participants.contains(req.identity()))
+    if (found == rooms_.end() || !found->second.participants.count(req.identity()))
       throw Error(503, "unavailable", "no response from servers");
     auto p = found->second.participants.at(req.identity());
     if (!req.muted() && !config_.enable_remote_unmute)
@@ -1276,10 +1274,10 @@ Json Rooms::api(const std::string& method, const Json& json, const Claims& claim
   const auto found = rooms_.find(name);
   if (method == "GetParticipant" || method == "RemoveParticipant" ||
       method == "UpdateParticipant") {
-    if (found == rooms_.end() || !found->second.participants.contains(json.value("identity", "")))
+    if (found == rooms_.end() || !found->second.participants.count(json.value("identity", "")))
       throw Error(404, "not_found", "participant does not exist");
   } else if (method == "UpdateSubscriptions") {
-    if (found == rooms_.end() || !found->second.participants.contains(json.value("identity", "")))
+    if (found == rooms_.end() || !found->second.participants.count(json.value("identity", "")))
       throw Error(503, "unavailable", "no response from servers");
   } else if (method == "SendData") {
     const auto req = from_json<livekit::SendDataRequest>(json);
@@ -1387,8 +1385,8 @@ Json Rooms::api(const std::string& method, const Json& json, const Claims& claim
           for (const auto& [sid, t] : other->tracks) {
             if (!p->claims.subscribe)
               p->subscriber->remove_track(sid);
-            else if ((p->subscriptions.contains(sid) ? p->subscriptions[sid] : p->auto_subscribe) &&
-                     (!was_subscribing || !p->subscription_allowed.contains(sid) ||
+            else if ((p->subscriptions.count(sid) ? p->subscriptions[sid] : p->auto_subscribe) &&
+                     (!was_subscribing || !p->subscription_allowed.count(sid) ||
                       !p->subscription_allowed[sid])) {
               // Go ReconcileAll retries pending subscriptions; it does not recheck
               // established ones merely because Recorder changed. A publisher ACL
@@ -1468,7 +1466,7 @@ void Rooms::finish_rpc(uint64_t id, std::optional<RpcRequests::Result> result) {
 }
 
 void Rooms::attempt_rpc(const std::shared_ptr<ApiRpc>& pending) {
-  if (!api_rpcs_.contains(pending->id))
+  if (!api_rpcs_.count(pending->id))
     return;
   ++pending->attempts;
   std::shared_ptr<Participant> target;
@@ -1488,7 +1486,7 @@ void Rooms::attempt_rpc(const std::shared_ptr<ApiRpc>& pending) {
           if (error || alive.expired())
             return;
           auto current = weak.lock();
-          if (!current || !api_rpcs_.contains(current->id))
+          if (!current || !api_rpcs_.count(current->id))
             return;
           if (current->attempts < 3)
             attempt_rpc(current);
@@ -1508,7 +1506,7 @@ void Rooms::attempt_rpc(const std::shared_ptr<ApiRpc>& pending) {
     if (alive.expired())
       return;
     auto current = weak.lock();
-    if (!current || !api_rpcs_.contains(current->id))
+    if (!current || !api_rpcs_.count(current->id))
       return;
     if (auto error = std::get_if<Error>(&result);
         error && (error->code == "unavailable" || error->code == "deadline_exceeded") &&
@@ -1527,7 +1525,7 @@ void Rooms::attempt_rpc(const std::shared_ptr<ApiRpc>& pending) {
           return p && !p->closed && p->subscriber->send_data(packet.SerializeAsString(), true);
         },
         complete);
-    if (api_rpcs_.contains(pending->id))
+    if (api_rpcs_.count(pending->id))
       pending->cancel = std::move(cancel);
     else
       cancel();
@@ -1609,15 +1607,15 @@ void Rooms::media_tick() {
           codec_maxima[codec_name(codec.mime_type())] = -1;
         for (const auto& [other_id, other] : room.participants) {
           if (other == p || other->closed || !other->claims.subscribe ||
-              other->disabled_tracks.contains(sid))
+              other->disabled_tracks.count(sid))
             continue;
-          bool wanted = other->subscriptions.contains(sid) ? other->subscriptions.at(sid)
-                                                           : other->auto_subscribe;
+          bool wanted = other->subscriptions.count(sid) ? other->subscriptions.at(sid)
+                                                        : other->auto_subscribe;
           if (!wanted || (!other->claims.is_recorder() &&
                           !p->subscription_permissions.allows(other->claims.identity, sid)))
             continue;
-          auto settings = other->track_settings.contains(sid) ? other->track_settings.at(sid)
-                                                              : VideoSubscription{};
+          auto settings = other->track_settings.count(sid) ? other->track_settings.at(sid)
+                                                           : VideoSubscription{};
           std::vector<VideoLayerChoice> choices;
           for (const auto& layer : track.info.layers())
             choices.push_back({uint32_t(layer.quality() + 1), layer.width(), layer.height(),
@@ -1629,7 +1627,7 @@ void Rooms::media_tick() {
           auto codec = state != subscriptions[other_id].end() && !state->second.codec.empty()
                            ? state->second.codec
                            : codec_name(track.info.mime_type());
-          if (codec_maxima.contains(codec))
+          if (codec_maxima.count(codec))
             codec_maxima[codec] = std::max(codec_maxima[codec], requested);
         }
         bool regress = false;
@@ -1648,8 +1646,8 @@ void Rooms::media_tick() {
         if (regress)
           for (const auto& [_, other] : room.participants)
             if (other != p && other->claims.subscribe &&
-                (other->subscriptions.contains(sid) ? other->subscriptions.at(sid)
-                                                    : other->auto_subscribe))
+                (other->subscriptions.count(sid) ? other->subscriptions.at(sid)
+                                                 : other->auto_subscribe))
               subscribe(other, sid, true);
         if (track.last_subscribed_quality != maximum ||
             track.last_codec_qualities != codec_maxima) {
@@ -1714,7 +1712,7 @@ void Rooms::media_tick() {
           continue;
         bool scoped = publisher == p;
         for (const auto& [sid, track] : publisher->tracks)
-          if (subscriptions[identity].contains(sid))
+          if (subscriptions[identity].count(sid))
             scoped = true;
         auto level = levels[publisher->info.sid()];
         if (scoped && level > 0)
@@ -1733,7 +1731,7 @@ void Rooms::media_tick() {
           auto state = subscriptions[identity].find(sid);
           if (state == subscriptions[identity].end())
             continue;
-          if (!p->stream_states.contains(sid) || p->stream_states[sid] != state->second.active) {
+          if (!p->stream_states.count(sid) || p->stream_states[sid] != state->second.active) {
             auto* info = streams.mutable_stream_state_update()->add_stream_states();
             info->set_participant_sid(publisher->info.sid());
             info->set_track_sid(sid);
@@ -1743,14 +1741,14 @@ void Rooms::media_tick() {
         }
       }
       for (const auto& [sid, level] : p->speaker_levels)
-        if (!audible.contains(sid)) {
+        if (!audible.count(sid)) {
           auto* speaker = speakers.mutable_speakers_changed()->add_speakers();
           speaker->set_sid(sid);
           speaker->set_active(false);
           speaker->set_level(0);
         }
       for (const auto& [sid, level] : audible)
-        if (p->replay_speakers || !p->speaker_levels.contains(sid) ||
+        if (p->replay_speakers || !p->speaker_levels.count(sid) ||
             p->speaker_levels[sid] != level) {
           auto* speaker = speakers.mutable_speakers_changed()->add_speakers();
           speaker->set_sid(sid);
@@ -1760,7 +1758,7 @@ void Rooms::media_tick() {
       p->speaker_levels = std::move(audible);
       p->replay_speakers = false;
       for (auto it = p->stream_states.begin(); it != p->stream_states.end();)
-        if (!subscriptions[identity].contains(it->first))
+        if (!subscriptions[identity].count(it->first))
           it = p->stream_states.erase(it);
         else
           ++it;

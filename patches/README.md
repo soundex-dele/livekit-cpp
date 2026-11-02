@@ -34,6 +34,9 @@ then `scripts/build-linux.sh`; its source build rebuilds the native library.
 twice; `git apply --reverse --check` can verify an already applied patch.
 
 CMake checks the normalized source SHA-256 and fails on a different version.
+The pinned source also includes the C++17 aggregate-initialization conversion;
+it preserves the pacer TTL fix above. Use the matching sibling WebRTC checkout
+when rebuilding instead of applying only the TTL patch to an older snapshot.
 It never patches the dependency automatically. For prebuilt imports this cannot
 prove the library was rebuilt: the `native-send` CTest exercises the linked
 native queue and must pass before delivery. Its regression covers an empty

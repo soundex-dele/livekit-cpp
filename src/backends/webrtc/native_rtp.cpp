@@ -337,7 +337,7 @@ struct NativeRtpSender::Impl : webrtc::RtpPacketSender,
       bool missing = needs_keyframe || switching ||
                      frame.num_references > webrtc::EncodedFrame::kMaxFrameReferences;
       for (size_t i = 0; !missing && i < frame.num_references; ++i)
-        missing = !admitted_frames.contains(frame.references[i]);
+        missing = !admitted_frames.count(frame.references[i]);
       if (missing) {
         if (frame_diagnostics < 8) {
           ++frame_diagnostics;
@@ -349,7 +349,7 @@ struct NativeRtpSender::Impl : webrtc::RtpPacketSender,
         return false;
       }
     }
-    if (!switching && admitted_frames.contains(frame.Id())) {
+    if (!switching && admitted_frames.count(frame.Id())) {
       if (frame_diagnostics < 8) {
         ++frame_diagnostics;
         RTC_LOG(LS_INFO) << "SFU frame gate duplicate source=" << source_ssrc

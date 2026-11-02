@@ -557,7 +557,7 @@ void Peer::add_track(const std::string& sid, const std::string& participant_sid,
     if (variant.codec)
       codecs.push_back(*variant.codec);
   }
-  if (senders_.contains(sid)) {
+  if (senders_.count(sid)) {
     if (sfu_) {
       auto& current = sender_codecs_[senders_[sid]->id()];
       bool changed = current != codecs;
@@ -626,7 +626,7 @@ void Peer::add_track(const std::string& sid, const std::string& participant_sid,
       senders_[sid] = sender;
       break;
     }
-    if (!senders_.contains(sid)) {
+    if (!senders_.count(sid)) {
       webrtc::RtpTransceiverInit init;
       init.direction = webrtc::RtpTransceiverDirection::kSendOnly;
       init.stream_ids = {stream_id};

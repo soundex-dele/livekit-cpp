@@ -20,7 +20,7 @@ Json yaml_value(const YAML::Node& node, size_t& remaining, unsigned depth = 0,
       if (!entry.first.IsScalar())
         throw std::runtime_error("Configuration mapping keys must be scalars");
       auto key = entry.first.as<std::string>();
-      if (object.contains(key))
+      if (object.count(key))
         throw std::runtime_error("Duplicate configuration mapping key");
       object[key] = yaml_value(entry.second, remaining, depth + 1,
                                string_values || (config_document && depth == 0 && key == "keys"),
@@ -81,7 +81,7 @@ Json parse_yaml(const std::string& text, bool config_document = true) {
 
 int64_t integer_field(const Json& object, const std::string& key, int64_t fallback,
                       int64_t minimum = INT64_MIN, int64_t maximum = INT64_MAX) {
-  if (!object.contains(key) || object.at(key).is_null())
+  if (!object.count(key) || object.at(key).is_null())
     return fallback;
   const auto& value = object.at(key);
   if (!value.is_number_integer() ||

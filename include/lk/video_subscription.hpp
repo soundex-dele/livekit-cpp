@@ -1,4 +1,5 @@
 #pragma once
+#include <tuple>
 #include <algorithm>
 #include <cstdint>
 #include <vector>
@@ -10,7 +11,15 @@ struct VideoSubscription {
   uint32_t width = 0, height = 0;
   uint32_t priority = 0;  // 1 is highest; 0 uses the default priority (last).
   uint32_t fps = 0;       // Temporal-layer cap; zero leaves the source frame rate intact.
-  bool operator==(const VideoSubscription&) const = default;
+
+  bool operator==(const VideoSubscription& other) const {
+    return std::tie(quality, width, height, priority, fps) ==
+           std::tie(other.quality, other.width, other.height, other.priority, other.fps);
+  }
+
+  bool operator!=(const VideoSubscription& other) const {
+    return !(*this == other);
+  }
 };
 
 struct VideoLayerChoice {

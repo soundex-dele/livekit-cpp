@@ -31,7 +31,7 @@ L3T3_KEY 混合对照 **20/20**、L1T3 **14/14**、L3T3 选层 **12/12**、原�
 此前平台产品规划的已实现功能、未交付能力及媒体失败仍见
 [功能现状与暂停交接](docs/STATUS_AND_HANDOFF.md)，控制面改进不代表这些失败已关闭。
 
-使用 C++20 实现的 LiveKit **单机服务端兼容项目**。原生 WebRTC 直接来自 `D:\workspace\webrtc`，不启动 Go 服务，也不经由 Rust FFI。
+使用 C++17 实现的 LiveKit **单机服务端兼容项目**。原生 WebRTC 直接来自 `D:\workspace\webrtc`，不启动 Go 服务，也不经由 Rust FFI。
 
 默认媒体链路是 **基于 libwebrtc 原生模块的 RTP 包级 SFU**，支持 Opus / PCMU / PCMA / VP8 / H.264 mode 1 / VP9 profile 0 / RTX，以及最多三层 VP8 simulcast 和 VP9 SVC 的手动空间选层。转发保留编码帧内容，服务端视频编解码调用数通过集成测试检查为零。NACK、RTX、PLI、重传缓存、RTCP 解析和上行拥塞反馈复用 libwebrtc。下行复用原生 pacing 和 GoogCC，应用层根据其预算进行音频预留、视频优先级分配和升降层。容量及完整弱网验收仍待完成，当前吞吐量不能按商业 RTC 产品估算。完整实施范围见 [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md)。
 
@@ -103,7 +103,7 @@ Ubuntu 22.04 的 dav1d 0.9.2 不具备所需 API；依赖脚本校验 SHA-512 �
 固定的 dav1d 1.5.3，安装到本项目 `out/linux-deps`。可设置 `DAV1D_ARCHIVE`
 复用离线归档；配置阶段会检查实际选中的头文件，避免编译中途才发现版本不兼容。
 构建适配还隔离 AOM 汇编与 C 特性宏的名称冲突，并为 Boost 1.74 显式选择
-C++20 的 `invoke_result`。实际 ELF 动态依赖包含 OpenSSL 3、libvpx 7、libc++、
+C++17 的 `invoke_result`。实际 ELF 动态依赖包含 OpenSSL 3、libvpx 7、libc++、
 libc++abi 和系统运行库；复制单个可执行文件不等于完成离线部署。
 
 ## 启动与连接

@@ -1,4 +1,5 @@
 #pragma once
+#include <tuple>
 #include "lk/media_quality.hpp"
 #include <api/environment/environment.h>
 #include <api/rtp_parameters.h>
@@ -80,7 +81,19 @@ struct NativeSendConfig {
   webrtc::VideoCodecType video_codec = webrtc::kVideoCodecVP8;
   std::string mid;
   std::vector<webrtc::RtpExtension> extensions;
-  bool operator==(const NativeSendConfig&) const = default;
+
+  bool operator==(const NativeSendConfig& other) const {
+    return std::tie(ssrc, rtx_ssrc, payload_type, rtx_payload_type, red_payload_type,
+                    h264_packetization_mode, audio, extmap_allow_mixed, video_codec, mid,
+                    extensions) ==
+           std::tie(other.ssrc, other.rtx_ssrc, other.payload_type, other.rtx_payload_type,
+                    other.red_payload_type, other.h264_packetization_mode, other.audio,
+                    other.extmap_allow_mixed, other.video_codec, other.mid, other.extensions);
+  }
+
+  bool operator!=(const NativeSendConfig& other) const {
+    return !(*this == other);
+  }
 };
 
 class NativeRtpSender {
@@ -147,7 +160,18 @@ struct NativeReceiveConfig {
   bool audio = false, encrypted = false;
   webrtc::VideoCodecType video_codec = webrtc::kVideoCodecVP8;
   std::vector<webrtc::RtpExtension> extensions;
-  bool operator==(const NativeReceiveConfig&) const = default;
+
+  bool operator==(const NativeReceiveConfig& other) const {
+    return std::tie(ssrc, payload_type, rtx_payload_type, red_payload_type, h264_packetization_mode,
+                    clock_rate_hz, audio, encrypted, video_codec, extensions) ==
+           std::tie(other.ssrc, other.payload_type, other.rtx_payload_type, other.red_payload_type,
+                    other.h264_packetization_mode, other.clock_rate_hz, other.audio,
+                    other.encrypted, other.video_codec, other.extensions);
+  }
+
+  bool operator!=(const NativeReceiveConfig& other) const {
+    return !(*this == other);
+  }
 };
 
 class NativeRtpReceiver {

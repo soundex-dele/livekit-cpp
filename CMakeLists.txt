@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 project(livekit_cpp VERSION 0.1.0 LANGUAGES C CXX)
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -82,8 +82,8 @@ target_link_libraries(livekit_core PUBLIC livekit_protocol WebRTC::webrtc Boost:
 target_link_libraries(livekit_core PRIVATE yaml-cpp::yaml-cpp)
 target_compile_definitions(livekit_core PUBLIC BOOST_ASIO_NO_DEPRECATED)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  # Boost 1.74 detects invoke_result only for GCC; libc++ removes result_of
-  # in C++20. All consumers of our Asio-bearing headers use C++20 as well.
+  # Boost 1.74 detects invoke_result only for GCC. Select the C++17
+  # replacement for deprecated result_of with Clang/libc++ as well.
   target_compile_definitions(livekit_core PUBLIC BOOST_ASIO_HAS_STD_INVOKE_RESULT=1)
 endif()
 if(MSVC)

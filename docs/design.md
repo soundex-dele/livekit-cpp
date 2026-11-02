@@ -6,7 +6,7 @@
 
 ## 1. 当前能力与限制
 
-现有 C++20 服务提供 `/rtc` 双 PeerConnection 信令、JWT 授权、RoomService 子集、Opus/VP8/RTX SFU、最多三层 VP8 simulcast 选层、数据通道、原生 GoogCC/pacing 和 coturn REST 凭证。默认 `media_mode=sfu`；旧 `relay` 解码重编码模式只作兼容，不等于 MCU。
+现有 C++17 服务提供 `/rtc` 双 PeerConnection 信令、JWT 授权、RoomService 子集、Opus/VP8/RTX SFU、最多三层 VP8 simulcast 选层、数据通道、原生 GoogCC/pacing 和 coturn REST 凭证。默认 `media_mode=sfu`；旧 `relay` 解码重编码模式只作兼容，不等于 MCU。
 
 Windows 与 Linux x64 服务端有构建和局部媒体测试证据，但文件四轨与 Windows→Linux/WSL 仍存在失败，不能宣称生产就绪、容量达标或全部弱网通过。现状和原始验收以 [交接记录](STATUS_AND_HANDOFF.md)、[兼容矩阵](COMPATIBILITY.md)、[VALIDATION](../VALIDATION.md)为准。
 

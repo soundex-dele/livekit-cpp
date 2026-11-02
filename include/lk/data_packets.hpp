@@ -16,7 +16,7 @@ class UserPacketDeduper {
   bool duplicate(const std::string& nonce) {
     if (nonce.size() != 16)
       return false;
-    if (seen_.contains(nonce))
+    if (seen_.count(nonce))
       return true;
     order_.push_back(nonce);
     seen_.insert(nonce);

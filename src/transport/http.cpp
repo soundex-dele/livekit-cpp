@@ -1,3 +1,4 @@
+#include "lk/compat.hpp"
 #include "lk/http.hpp"
 #include "lk/join_request.hpp"
 #include "lk/studio_admission.hpp"
@@ -67,7 +68,7 @@ struct Target {
 
 Claims authenticate(const Request& request, const Target& target, const Auth& auth) {
   auto header = std::string(request[http::field::authorization]);
-  if (header.starts_with("Bearer "))
+  if (lk::compat::starts_with(header, "Bearer "))
     return auth.verify(header.substr(7));
   if (auto it = target.query.find("access_token"); it != target.query.end())
     return auth.verify(it->second);
@@ -425,7 +426,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
         if (auto encoded = target.query.find("join_request");
             encoded != target.query.end() && !encoded->second.empty())
           join_request = decode_join_request(encoded->second);
-        else if (target.path.starts_with("/rtc/v1"))
+        else if (lk::compat::starts_with(target.path, "/rtc/v1"))
           throw Error(400, "invalid_argument", "join_request is required");
         if (join_request) {
           if ((!join_request->metadata().empty() ||
@@ -444,7 +445,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
           respond(error.status, error.what(), "text/plain; charset=utf-8");
           return;
         }
-        if (target.path.ends_with("/validate")) {
+        if (lk::compat::ends_with(target.path, "/validate")) {
           respond(200, "success", "text/plain");
           return;
         }
@@ -452,8 +453,8 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
           throw Error(400, "invalid_argument", "WebSocket upgrade required");
         auto session = std::make_shared<WebSocketSession>(std::move(stream_), rooms_, count_);
         bool auto_subscribe =
-            !target.query.contains("auto_subscribe") || target.query["auto_subscribe"] != "0";
-        bool reconnect = target.query.contains("reconnect") && target.query["reconnect"] == "1";
+            !target.query.count("auto_subscribe") || target.query["auto_subscribe"] != "0";
+        bool reconnect = target.query.count("reconnect") && target.query["reconnect"] == "1";
         if (join_request) {
           auto_subscribe = join_request->connection_settings().auto_subscribe();
           reconnect = join_request->reconnect();
@@ -476,12 +477,12 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
         return;
       }
       const std::string prefix = "/twirp/livekit.RoomService/";
-      if (!target.path.starts_with(prefix))
+      if (!lk::compat::starts_with(target.path, prefix))
         throw Error(404, "bad_route", "Route not found");
       // An absent token reaches the Go handler with no grants. In particular,
       // malformed input and routing errors are evaluated before API grants.
       Claims claims;
-      if (!request[http::field::authorization].empty() || target.query.contains("access_token"))
+      if (!request[http::field::authorization].empty() || target.query.count("access_token"))
         claims = authenticate(request, target, auth_);
       if (request.method() != http::verb::post)
         throw Error(404, "bad_route", "POST required");

@@ -1,3 +1,4 @@
+#include "lk/compat.hpp"
 #include "lk/config.hpp"
 #include <pc/ice_server_parsing.h>
 #include <openssl/evp.h>
@@ -14,7 +15,8 @@ void TurnRestAuth::validate() const {
   if (urls.empty() || urls.size() > 8)
     throw std::runtime_error("rtc.turn_rest urls must contain 1..8 TURN URLs");
   for (const auto& url : urls) {
-    if (url.size() > 2048 || (!url.starts_with("turn:") && !url.starts_with("turns:")) ||
+    if (url.size() > 2048 ||
+        (!lk::compat::starts_with(url, "turn:") && !lk::compat::starts_with(url, "turns:")) ||
         url.find_first_of("\r\n\t @") != std::string::npos)
       throw std::runtime_error(
           "rtc.turn_rest requires turn: or turns: URLs without embedded credentials");

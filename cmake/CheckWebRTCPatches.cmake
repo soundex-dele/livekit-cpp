@@ -4,7 +4,7 @@
 file(READ "${WEBRTC_ROOT}/modules/pacing/prioritized_packet_queue.cc" LK_PACER_SOURCE)
 string(REPLACE "\r\n" "\n" LK_PACER_SOURCE "${LK_PACER_SOURCE}")
 string(SHA256 LK_PACER_SHA256 "${LK_PACER_SOURCE}")
-if(NOT LK_PACER_SHA256 STREQUAL "ad610ee3bfca53ce02eb53d6cc08c46595606eac20687b84699b1d9c72788124")
+if(NOT LK_PACER_SHA256 STREQUAL "c31254c1f6a697e014b2de478caf38069bdb770c5e76818cffa3bf129cc40d09")
   message(FATAL_ERROR
     "Unsupported/unpatched WebRTC pacer (${LK_PACER_SHA256}). See patches/README.md. "
     "Apply patches/webrtc-m137-pacer-pause-ttl.patch to the pinned WEBRTC_ROOT and "

@@ -1,3 +1,4 @@
+#include "lk/compat.hpp"
 #include "lk/join_request.hpp"
 #include <openssl/evp.h>
 #include <zlib.h>
@@ -65,7 +66,9 @@ livekit::JoinRequest decode_join_request(const std::string& encoded) {
   }
   if (base64.empty() || base64.size() % 4)
     reject("cannot base64 decode wrapped join request");
-  const auto padding = base64.ends_with("==") ? 2 : base64.ends_with("=") ? 1 : 0;
+  const auto padding = lk::compat::ends_with(base64, "==")  ? 2
+                       : lk::compat::ends_with(base64, "=") ? 1
+                                                            : 0;
   if (base64.substr(0, base64.size() - padding).find('=') != std::string::npos)
     reject("cannot base64 decode wrapped join request");
   std::string bytes(base64.size() / 4 * 3, '\0');

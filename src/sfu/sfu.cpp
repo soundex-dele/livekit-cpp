@@ -1,3 +1,4 @@
+#include "lk/compat.hpp"
 #include "lk/sfu.hpp"
 #include "lk/audio_activity.hpp"
 #include "lk/media_codec.hpp"
@@ -159,7 +160,15 @@ struct LayerSpec {
   uint32_t ssrc = 0, rtx = 0;
   std::string rid;
   int quality = 2;
-  bool operator==(const LayerSpec&) const = default;
+
+  bool operator==(const LayerSpec& other) const {
+    return std::tie(ssrc, rtx, rid, quality) ==
+           std::tie(other.ssrc, other.rtx, other.rid, other.quality);
+  }
+
+  bool operator!=(const LayerSpec& other) const {
+    return !(*this == other);
+  }
 };
 
 struct Source : webrtc::RtpPacketSinkInterface {
@@ -237,7 +246,7 @@ struct Source : webrtc::RtpPacketSinkInterface {
       auto repair = repairs.find(primary);
       if (repair == repairs.end()) {
         std::string rid;
-        if (identified.GetExtension<webrtc::RepairedRtpStreamId>(&rid) && rids.contains(rid))
+        if (identified.GetExtension<webrtc::RepairedRtpStreamId>(&rid) && rids.count(rid))
           for (const auto& [ssrc, layer] : layers)
             if (layer->spec.rid == rid && !layer->spec.rtx) {
               layer->spec.rtx = primary;
@@ -255,10 +264,10 @@ struct Source : webrtc::RtpPacketSinkInterface {
                identified.PayloadType() == config.red_payload_type) {
       std::string rid;
       identified.GetExtension<webrtc::RtpStreamId>(&rid);
-      if (!layers.contains(primary) && counters->unmapped_packets < 5)
+      if (!layers.count(primary) && counters->unmapped_packets < 5)
         RTC_LOG(LS_INFO) << "SFU unknown primary " << primary << " rid=" << rid
                          << " negotiated-rids=" << rids.size() << " known-layers=" << layers.size();
-      if (!layers.contains(primary) && !config.audio && rids.contains(rid) && layers.size() < 3) {
+      if (!layers.count(primary) && !config.audio && rids.count(rid) && layers.size() < 3) {
         bool bound = false;
         for (const auto& [_, layer] : layers)
           bound |= layer->spec.rid == rid;
@@ -266,7 +275,7 @@ struct Source : webrtc::RtpPacketSinkInterface {
           add_layer({primary, 0, rid, rids.at(rid)});
       }
       if (auto it = layers.find(primary); it != layers.end() && !rid.empty()) {
-        if (!rids.contains(rid) || (!it->second->spec.rid.empty() && it->second->spec.rid != rid)) {
+        if (!rids.count(rid) || (!it->second->spec.rid.empty() && it->second->spec.rid != rid)) {
           ++counters->unmapped_packets;
           return;
         }
@@ -343,8 +352,8 @@ struct Source : webrtc::RtpPacketSinkInterface {
             auto key = std::tuple{layer->spec.ssrc, spatial, temporal};
             auto it = selection_ids.find(key);
             if (it == selection_ids.end()) {
-              while (!next_selection || layers.contains(next_selection) ||
-                     selections.contains(next_selection))
+              while (!next_selection || layers.count(next_selection) ||
+                     selections.count(next_selection))
                 ++next_selection;
               it = selection_ids.emplace(key, next_selection++).first;
               selections.emplace(it->second, Selection{layer->spec.ssrc, spatial, temporal});
@@ -374,7 +383,7 @@ struct Source : webrtc::RtpPacketSinkInterface {
   }
 
   void add_layer(const LayerSpec& spec) {
-    if (!spec.ssrc || layers.contains(spec.ssrc))
+    if (!spec.ssrc || layers.count(spec.ssrc))
       return;
     auto layer = std::make_unique<Layer>();
     layer->spec = spec;
@@ -968,7 +977,7 @@ struct SfuSession::State : std::enable_shared_from_this<State> {
       if (!report.Parse(header))
         return;
       for (auto& input : inputs)
-        if (input->transport == transport && input->layers.contains(report.sender_ssrc()))
+        if (input->transport == transport && input->layers.count(report.sender_ssrc()))
           for (auto& weak : input->outputs)
             if (auto out = weak.lock())
               out->sender_report(report);
@@ -1071,8 +1080,8 @@ struct SfuSession::State : std::enable_shared_from_this<State> {
         input->congestion = receiver;
         NativeReceiveConfig config;
         config.audio = s.track->kind() == "audio";
-        config.encrypted = encrypted_publications.contains(s.track->id()) &&
-                           encrypted_publications.at(s.track->id());
+        config.encrypted =
+            encrypted_publications.count(s.track->id()) && encrypted_publications.at(s.track->id());
         const auto codec = primary_media_codec(s.parameters, config.audio);
         if (!codec || !codec->clock_rate)
           continue;
@@ -1141,13 +1150,13 @@ struct SfuSession::State : std::enable_shared_from_this<State> {
     }
     inputs = std::move(active_inputs);
     for (auto it = receive_transports.begin(); it != receive_transports.end();) {
-      if (!observed.contains(it->first))
+      if (!observed.count(it->first))
         it = receive_transports.erase(it);
       else
         ++it;
     }
     for (auto it = send_transports.begin(); it != send_transports.end();) {
-      if (!observed.contains(it->first))
+      if (!observed.count(it->first))
         it = send_transports.erase(it);
       else
         ++it;
@@ -1269,7 +1278,7 @@ void SfuSession::add(const std::string& sid, const std::string& sender_id, Track
       if ((*it)->track != track &&
           std::find(variants.begin(), variants.end(), (*it)->track) == variants.end()) {
         auto& attached = (*it)->outputs;
-        std::erase_if(attached, [&](const auto& weak) {
+        lk::compat::erase_if(attached, [&](const auto& weak) {
           auto existing = weak.lock();
           return !existing || existing == out;
         });
@@ -1356,7 +1365,7 @@ std::map<std::string, MediaSubscriptionState> SfuSession::states() const {
                                                                              : 0)
                                         : 10;
       if (out->config.red_payload_type >= 0 ||
-          (out->negotiated_codec && out->negotiated_codec->parameters.contains("useinbandfec") &&
+          (out->negotiated_codec && out->negotiated_codec->parameters.count("useinbandfec") &&
            out->negotiated_codec->parameters.at("useinbandfec") == "1"))
         weight /= 1.5;
       out->quality.update(
@@ -1387,11 +1396,11 @@ std::map<const webrtc::MediaStreamTrackInterface*, MediaSourceState> SfuRouter::
                               : 10;
           if (source->config.red_payload_type >= 0 ||
               (source->codec_parameters &&
-               source->codec_parameters->parameters.contains("useinbandfec") &&
+               source->codec_parameters->parameters.count("useinbandfec") &&
                source->codec_parameters->parameters.at("useinbandfec") == "1"))
             weight /= 1.5;
           layer->quality.update(impl_->env.clock().CurrentTime().ms(), layer->receiver->quality(),
-                                weight, muted.contains(key), false);
+                                weight, muted.count(key), false);
           state.quality_score = std::min(state.quality_score, layer->quality.score());
         }
       }

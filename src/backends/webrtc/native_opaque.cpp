@@ -230,7 +230,7 @@ struct NativeOpaqueAssembler::Impl {
     }
     auto key = std::pair{packet.Timestamp(), spatial};
     auto& group = groups[key];
-    if (group.packets.contains(seq))
+    if (group.packets.count(seq))
       return;
     if (group.packets.empty())
       group.header = h;
@@ -256,7 +256,7 @@ struct NativeOpaqueAssembler::Impl {
           break;
         if (it->first != *group.first && d.FirstPacketInSubFrame())
           break;
-        if (!group.packets.contains(it->first)) {
+        if (!group.packets.count(it->first)) {
           group.bytes += it->second.payload_size();
           group.packets.emplace(*it);
         }
@@ -274,7 +274,7 @@ struct NativeOpaqueAssembler::Impl {
         *group.last - *group.first < 2048) {
       bool complete = true;
       for (auto s = *group.first; s <= *group.last; ++s)
-        if (!group.packets.contains(s)) {
+        if (!group.packets.count(s)) {
           complete = false;
           break;
         }

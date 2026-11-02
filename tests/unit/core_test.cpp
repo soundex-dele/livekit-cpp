@@ -1,3 +1,4 @@
+#include "lk/compat.hpp"
 #include "lk/rooms.hpp"
 #include "lk/video_allocation.hpp"
 #include <iostream>
@@ -215,7 +216,7 @@ int main() {
     admin.admin = true;
     admin.room = "demo";
     auto room = rooms.api("CreateRoom", {{"name", "demo"}, {"maxParticipants", 1}}, admin);
-    check(room["sid"].get<std::string>().starts_with("RM_"), "Room SID missing");
+    check(lk::compat::starts_with(room["sid"].get<std::string>(), "RM_"), "Room SID missing");
     check(rooms.api("CreateRoom", {{"name", "demo"}}, admin)["sid"] == room["sid"],
           "CreateRoom not idempotent");
     rejected([&] { rooms.api("ListRooms", lk::Json::object(), claims); }, 401);
@@ -244,7 +245,7 @@ int main() {
           "Missing room did not return an empty participant list");
     check(rooms.metrics()["rooms"] == 1, "Listing a missing room created it");
     auto empty_name_room = rooms.api("CreateRoom", lk::Json::object(), admin);
-    check(empty_name_room["sid"].get<std::string>().starts_with("RM_"),
+    check(lk::compat::starts_with(empty_name_room["sid"].get<std::string>(), "RM_"),
           "Go-compatible empty room name rejected by management API");
     rooms.api("DeleteRoom", {{"room", ""}}, admin);
     check(rooms.metrics()["rooms"] == 1, "Empty-name room was not removed");
@@ -253,7 +254,8 @@ int main() {
     check(sink->messages.front().has_join() && sink->messages.front().join().subscriber_primary(),
           "Join response invalid");
     const auto join_ice = sink->messages.front().join().ice_servers();
-    check(join_ice.size() == 1 && join_ice[0].username().ends_with(":" + p->info.sid()) &&
+    check(join_ice.size() == 1 &&
+              lk::compat::ends_with(join_ice[0].username(), ":" + p->info.sid()) &&
               join_ice[0].credential() != config.turn_rest->shared_secret &&
               join_ice[0].credential().size() == 28,
           "Join response did not contain session-scoped TURN credentials");
@@ -310,8 +312,7 @@ int main() {
       cached_info->set_sid("PA_cache_" + std::to_string(i));
       cache_probe.send(cache_update);
     }
-    check(cache_probe.update_cache.size() == 128 &&
-              !cache_probe.update_cache.contains("PA_cache_0") &&
+    check(cache_probe.update_cache.size() == 128 && !cache_probe.update_cache.count("PA_cache_0") &&
               cache_probe.update_cache.at("PA_cache_199").info.metadata().empty(),
           "Resume cache unbounded or retained peer metadata");
     lk::Claims bob = claims;
@@ -543,11 +544,11 @@ int main() {
           "Subscription dimensions/priority not retained before media arrives");
     setting->set_disabled(true);
     rooms.signal(sub, request);
-    check(sub->disabled_tracks.contains(sid), "Subscription disable setting ignored");
+    check(sub->disabled_tracks.count(sid), "Subscription disable setting ignored");
     setting->set_disabled(false);
     setting->set_fps(10);
     rooms.signal(sub, request);
-    check(sub->track_settings.at(sid).fps == 10 && !sub->disabled_tracks.contains(sid),
+    check(sub->track_settings.at(sid).fps == 10 && !sub->disabled_tracks.count(sid),
           "FPS setting or re-enable was not retained");
     setting->set_fps(0);
     setting->set_width(16385);
