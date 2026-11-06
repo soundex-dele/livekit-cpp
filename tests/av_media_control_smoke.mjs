@@ -14,13 +14,15 @@ const api = process.env.AV_SMOKE_API?.replace(/\/$/, '');
 const api2 = (process.env.AV_SMOKE_API2 || api)?.replace(/\/$/, '');
 const bearer = process.env.AV_SMOKE_TOKEN;
 const memberBearer = process.env.AV_SMOKE_MEMBER_TOKEN;
+const adminBearer = process.env.AV_SMOKE_ADMIN_TOKEN;
 const organization = process.env.AV_SMOKE_ORGANIZATION;
 assert.ok(api && bearer && organization,
   'AV_SMOKE_API, AV_SMOKE_TOKEN and AV_SMOKE_ORGANIZATION are required');
 const output = resolve(process.env.AV_SMOKE_OUTPUT || resolve(here, 'results/av-control-media.json'));
-const secrets = new Set([bearer, memberBearer]);
+const secrets = new Set([bearer, memberBearer, adminBearer]);
 const report = {test: 'av-control-synthetic-media', started_at: new Date().toISOString(),
   source: 'synthetic canvas VP8 and oscillator Opus; no capture devices',
+  admin_governance: !!adminBearer,
   checks: [], scenarios: {}, diagnostics: [], cleanup: [], phase: 'testing', passed: false};
 const pages = [];
 const delay = ms => new Promise(r => setTimeout(r, ms));
@@ -151,6 +153,20 @@ async function ok(path, options) {
   const result = await request(path, options);
   assert.equal(result.status, 200, `${path}: HTTP ${result.status}, ${result.data.error?.code || 'unknown error'}`);
   return result.data;
+}
+async function govern(resource, action, fallback) {
+  if (!adminBearer) return fallback();
+  const response = await fetch(`${api2}/api/v1/av/admin/organizations/${organization}/resources/${resource}/actions`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'X-Foundation-Request': '1',
+      Authorization: `Bearer ${adminBearer}`, 'Idempotency-Key': crypto.randomUUID()},
+    body: JSON.stringify({action, reason: 'Non-participant administrator synthetic-media validation'}),
+    signal: AbortSignal.timeout(8000),
+  });
+  const data = await response.json();
+  assert.equal(response.status, 200, `administrative ${action}: ${data.error?.code}`);
+  assert.ok(data.accepted && data.action_id);
+  return data;
 }
 async function eventually(fn, description, timeout = 20000) {
   const end = Date.now() + timeout;
@@ -366,7 +382,7 @@ async function conferenceScenario(origin) {
   const revocation = await assertRevocation([
     {page: host, grant_id: hostGrant.grant_id, principal: 'user'},
     {page: attendee, grant_id: guestGrant.grant_id, principal: 'guest'},
-  ], () => ok(`${path}/end`, {base: api2}));
+  ], () => govern(meeting.id, 'end', () => ok(`${path}/end`, {base: api2})));
   activeCleanup = undefined;
   report.scenarios.conference = {hostMedia, guestMedia, revocation, waiting_room_enforced: true};
   pass('conference waiting-room admission, bidirectional decoded audio/video and end revocation');
@@ -415,7 +431,7 @@ async function liveScenario(origin) {
     peers.push({page: host, grant_id: broadcast.stage_grant_id, principal: 'user'},
       {page: memberPage, grant_id: access.grant_id, principal: 'member'});
   }
-  const revocation = await assertRevocation(peers, () => ok(`${path}/end`, {base: api2}));
+  const revocation = await assertRevocation(peers, () => govern(broadcast.id, 'end', () => ok(`${path}/end`, {base: api2})));
   activeCleanup = undefined;
   report.scenarios.live = {program, stage, revocation};
   pass(`live program audio/video${stage.covered ? ', isolated bidirectional stage' : ''} and broadcast end revocation`);
@@ -470,7 +486,7 @@ async function assistScenario(origin) {
   const revocation = await assertRevocation([
     {page: host, grant_id: hostGrant.grant_id, principal: 'user'},
     {page: controller, grant_id: controllerGrant.grant_id, principal: 'guest'},
-  ], () => ok(`control-grants/${lease.id}/revoke`, {body: {epoch: lease.epoch}, base: api2}));
+  ], () => govern(value.id, 'revoke-control', () => ok(`control-grants/${lease.id}/revoke`, {body: {epoch: lease.epoch}, base: api2})));
   await ok(`${path}/stop`);
   activeCleanup = undefined;
   report.scenarios.assist = {screen, input_recorded_and_echoed: true, os_input_injected: false, revocation};
@@ -543,7 +559,7 @@ try {
   await heartbeatPending;
   if (heartbeatFailure) throw heartbeatFailure;
   const revokeStart = Date.now();
-  await ok(`${path}/stop`, {base: api2});
+  await govern(session.id, 'end', () => ok(`${path}/stop`, {base: api2}));
   stopped = true;
   const denied = await request(`rtc-grants/${senderGrant.grant_id}/credentials`, {principal: 'guest'});
   assert.equal(denied.status, 403, 'stopped session cannot issue a new RTC token');

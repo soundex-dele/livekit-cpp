@@ -28,6 +28,7 @@ Install the existing `tests/package.json` dependencies and provide Chrome (or se
 | `AV_SMOKE_TOKEN` | Authenticated Foundation bearer session |
 | `AV_SMOKE_ORGANIZATION` | Initialized AV organization ID |
 | `AV_SMOKE_MEMBER_TOKEN` | Second signed-in organization member for the interactive live stage |
+| `AV_SMOKE_ADMIN_TOKEN` | Optional platform-admin session for explicit non-participant governance |
 | `AV_SMOKE_OUTPUT` | JSON report path; defaults to `tests/results/av-control-media.json` |
 
 Run `node livekit-cpp/tests/av_media_control_smoke.mjs` from the workspace, or use
@@ -35,6 +36,14 @@ Run `node livekit-cpp/tests/av_media_control_smoke.mjs` from the workspace, or u
 real services and pass these variables without command-line credentials. The
 harness provisions the second member. Without `AV_SMOKE_MEMBER_TOKEN`, the report
 explicitly marks interactive stage coverage absent; the four core paths still run.
+
+Add `--admin-governance` to the process harness to exercise the administrative
+end/revoke routes. It creates resources under a separate organization and supplies
+a platform administrator who never joins that organization or its media sessions.
+Without the optional admin token, the original participant actions remain in use.
+The administrative run is recorded in `livekit-server/out/admin-media-integration.json`;
+all six media assertions and owned-process cleanup passed with Chromium headless
+shell 153.0.8010.12 on 2026-11-06.
 
 API requests run in Node; the browser only serves the local SDK page and connects
 to the API-provided media URL. No camera, microphone, desktop automation or capture
