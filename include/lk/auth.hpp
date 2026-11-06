@@ -9,6 +9,8 @@ struct Claims {
   std::string room_preset;
   std::string studio_grant;
   std::string conference_grant;
+  std::string issuer, av_grant, av_node_id, av_node_incarnation;
+  int64_t av_policy_version = 0, av_binding_generation = 0, av_grant_expires_at = 0;
   int64_t expires_at = 0;
   bool join = false, create = false, list = false, admin = false;
   bool publish = true, subscribe = true, publish_data = true, update_metadata = false;

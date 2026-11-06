@@ -2,6 +2,8 @@
 
 [媒体服务设计](docs/design.md)说明 SFU 模块、原生依赖、业务服务边界和后续 worker 架构；[平台总体设计](../docs/architecture/platform-design.md)定义跨仓库契约。
 
+[AV 业务控制面接入](docs/AV_CONTROL.md)说明组织化业务服务的媒体节点模式、统一准入、Token 刷新和带版本检查的媒体管理接口。
+
 2026-10-27 已启动 [Go LiveKit 主服务完整替代](docs/GO_REPLACEMENT.md)：以本地
 1.13.10 为基线，兼容现有 Egress/Ingress/SIP/Agent worker。替代尚未完成。
 最新 [VP9 验证](docs/GO_VP9_VALIDATION.md)：增加 profile 0 原生转发和独立空间层选择，

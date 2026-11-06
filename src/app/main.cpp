@@ -1,4 +1,5 @@
 #include "lk/http.hpp"
+#include "lk/av_control.hpp"
 #include <boost/asio/signal_set.hpp>
 #include <iostream>
 #include <cstdlib>
@@ -73,6 +74,15 @@ int main(int argc, char** argv) {
     if (port)
       config.port = static_cast<uint16_t>(port);
     config.validate();
+    const auto av_error = lk::configure_av(config);
+    if (!av_error.empty()) {
+      std::cerr << av_error << '\n';
+      return 1;
+    }
+    if (token && config.av_mode) {
+      std::cerr << "AV mode issues RTC credentials through the business control plane\n";
+      return 1;
+    }
     if (token) {
       if (room.empty() || identity.empty())
         throw std::runtime_error("--token needs --room and --identity");

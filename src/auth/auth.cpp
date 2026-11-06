@@ -97,7 +97,14 @@ Claims Auth::verify(const std::string& token, int64_t now) const {
         (!claims["nbf"].is_number() || double(now) + 60 < std::floor(claims["nbf"].get<double>())))
       throw std::runtime_error("Token not active");
     Claims c;
+    c.issuer = key->first;
     c.expires_at = claims.value("exp", int64_t(0));
+    c.av_grant = claims.value("av_grant", "");
+    c.av_policy_version = claims.value("av_policy_version", int64_t(0));
+    c.av_binding_generation = claims.value("av_binding_generation", int64_t(0));
+    c.av_node_id = claims.value("av_node_id", "");
+    c.av_node_incarnation = claims.value("av_node_incarnation", "");
+    c.av_grant_expires_at = claims.value("av_grant_expires_at", int64_t(0));
     c.studio_grant = claims.value("studio_grant", "");
     c.conference_grant = claims.value("conference_grant", "");
     c.room_preset = claims.value("roomPreset", "");
@@ -172,6 +179,13 @@ Claims Auth::verify(const std::string& token, int64_t now) const {
 std::string Auth::refresh(const Claims& c, int64_t now) const {
   if (keys_.empty())
     throw std::runtime_error("No signing key configured");
+  // Verified claims retain their issuer. Never switch an RTC token to another
+  // configured key just because its issuer sorts first in a map.
+  const auto signer = c.issuer.empty() ? keys_.begin() : keys_.find(c.issuer);
+  if (signer == keys_.end() ||
+      (!c.av_grant.empty() && (c.av_grant_expires_at <= now || c.av_policy_version <= 0))) {
+    return {};
+  }
   auto video = c.video_grant;
   auto flag = [&](const char* field, bool value) {
     if (value)
@@ -209,14 +223,23 @@ std::string Auth::refresh(const Claims& c, int64_t now) const {
   for (auto field : {"roomRecord", "ingressAdmin"})
     if (video.contains(field) && video[field] == false)
       video.erase(field);
-  Json payload{{"iss", keys_.begin()->first},
+  Json payload{{"iss", signer->first},
                {"sub", c.identity},
                {"identity", c.identity},
                {"iat", now},
                {"nbf", now},
-               {"exp", std::max(now + 600, c.expires_at)},
+               {"exp", c.av_grant.empty() ? std::max(now + 600, c.expires_at)
+                                          : std::min(now + 60, c.av_grant_expires_at)},
                {"video", video}};
   const auto kind = c.kind;
+  if (!c.av_grant.empty()) {
+    payload["av_grant"] = c.av_grant;
+    payload["av_policy_version"] = c.av_policy_version;
+    payload["av_binding_generation"] = c.av_binding_generation;
+    payload["av_node_id"] = c.av_node_id;
+    payload["av_node_incarnation"] = c.av_node_incarnation;
+    payload["av_grant_expires_at"] = c.av_grant_expires_at;
+  }
   if (!c.studio_grant.empty())
     payload["studio_grant"] = c.studio_grant;
   if (!c.conference_grant.empty())
@@ -267,6 +290,6 @@ std::string Auth::refresh(const Claims& c, int64_t now) const {
   }
   // The pinned Go refresh intentionally carries neither kindDetails nor the
   // independent SIP/Agent/etc grants, audience, jti, or arbitrary JWT claims.
-  return sign(payload, keys_.begin()->second);
+  return sign(payload, signer->second);
 }
 }  // namespace lk

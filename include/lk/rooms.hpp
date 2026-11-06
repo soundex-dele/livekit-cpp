@@ -51,6 +51,7 @@ struct Participant {
   std::set<std::string> disabled_tracks;
   std::map<std::string, VideoSubscription> track_settings;
   bool auto_subscribe = true, closed = false, ice_connected = false;
+  bool av_refresh_pending = false;
   int single_pc_protocol = -1;
   livekit::ClientInfo client_info;
 
@@ -136,6 +137,12 @@ class Rooms {
   void shutdown();
   Json metrics() const;
 
+  const Config& config() const {
+    return config_;
+  }
+
+  Json av_operation(const Json&, const Claims&, int& status);
+
  private:
   Room& create(const livekit::CreateRoomRequest&);
   Room& room(const std::string&);
@@ -171,6 +178,23 @@ class Rooms {
   uint64_t next_api_rpc_ = 0;
   std::shared_ptr<int> rpc_lifetime_ = std::make_shared<int>(0);
   std::map<std::string, Room> rooms_;
+
+  struct AvTargetFence {
+    int64_t revision = 0;
+    bool removed = false;
+    std::string operation_id, request;
+    Json result;
+  };
+
+  struct AvRoomFence {
+    int64_t generation = 0;
+    bool sealed = false;
+    std::map<std::string, AvTargetFence> targets;
+  };
+
+  // Accessed only on io_. Tombstones survive room cleanup until this node
+  // incarnation exits, preventing delayed operations from recreating a room.
+  std::map<std::string, AvRoomFence> av_fences_;
   bool stopping_ = false;
 };
 }  // namespace lk

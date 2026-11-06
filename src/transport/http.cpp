@@ -2,6 +2,7 @@
 #include "lk/http.hpp"
 #include "lk/join_request.hpp"
 #include "lk/studio_admission.hpp"
+#include "lk/av_control.hpp"
 #include "lk/twirp.hpp"
 #include <boost/beast.hpp>
 #include <google/protobuf/dynamic_message.h>
@@ -122,6 +123,13 @@ class WebSocketSession : public SignalSink, public std::enable_shared_from_this<
               self->claims_, auto_subscribe, self,
               self->join_request_ ? std::max(0, self->join_request_->client_info().protocol()) : -1,
               self->client_info_);
+        }
+        if (!self->participant_) {
+          livekit::SignalResponse response;
+          response.mutable_leave()->set_reason(livekit::STATE_MISMATCH);
+          self->send(response);
+          self->close();
+          return;
         }
         if (self->join_request_) {
           livekit::SignalRequest message;
@@ -399,14 +407,69 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
         respond(200, "{\"status\":\"ok\",\"version\":\"0.1.0\"}");
         return;
       }
+      if (target.path == "/internal/v1/media/node" ||
+          target.path == "/internal/v1/media/operations") {
+        const auto claims = authenticate(request, target, auth_);
+        const auto& config = rooms_.config();
+        if (!av_management_claims_valid(config, claims)) {
+          respond(403, "{\"error\":{\"code\":\"management_credential_required\"}}");
+          return;
+        }
+        if (target.path == "/internal/v1/media/node" && request.method() == http::verb::get &&
+            claims.list) {
+          respond(200, Json{{"node_id", config.node_id},
+                            {"node_incarnation", config.node_incarnation},
+                            {"av_mode", true},
+                            {"ready", true},
+                            {"metrics", rooms_.metrics()}}
+                           .dump());
+          return;
+        }
+        if (target.path == "/internal/v1/media/operations" &&
+            request.method() == http::verb::post) {
+          const auto input = Json::parse(request.body(), nullptr, false);
+          if (!input.is_object()) {
+            respond(400, "{\"error\":{\"code\":\"invalid_operation\"}}");
+            return;
+          }
+          int status = 200;
+          const auto result = rooms_.av_operation(input, claims, status);
+          respond(status, result.dump());
+          return;
+        }
+        respond(403, "{\"error\":{\"code\":\"permission_denied\"}}");
+        return;
+      }
       if (target.path == "/rtc" || target.path == "/rtc/validate" || target.path == "/rtc/v1" ||
           target.path == "/rtc/v1/validate") {
         if (request.method() != http::verb::get)
           throw Error(405, "bad_route", "GET required");
         auto claims = authenticate(request, target, auth_);
+        const auto& config = rooms_.config();
+        if (config.av_mode) {
+          if (!av_rtc_claims_valid(config, claims, now_ms() / 1000)) {
+            respond(401, "{\"code\":\"unauthenticated\",\"msg\":\"AV grant required\"}");
+            return;
+          }
+          if (!av_admitted_) {
+            av_admission(stream_.get_executor(), config, claims,
+                         [self = shared_from_this(),
+                          request = std::move(request)](AdmissionResult result) mutable {
+                           if (!result.allowed) {
+                             self->respond(
+                                 401,
+                                 "{\"code\":\"unauthenticated\",\"msg\":\"AV admission denied\"}");
+                             return;
+                           }
+                           self->av_admitted_ = true;
+                           self->handle(std::move(request));
+                         });
+            return;
+          }
+        }
         if (!claims.join)
           throw Error(403, "permission_denied", "Room join grant required");
-        if ((!claims.studio_grant.empty() || !claims.conference_grant.empty()) &&
+        if (!config.av_mode && (!claims.studio_grant.empty() || !claims.conference_grant.empty()) &&
             !studio_admitted_) {
           studio_admission(
               stream_.get_executor(), claims,
@@ -467,6 +530,10 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
       }
       if (target.path == "/metrics") {
         auto c = authenticate(request, target, auth_);
+        if (rooms_.config().av_mode && !av_management_claims_valid(rooms_.config(), c)) {
+          respond(403, "{\"code\":\"permission_denied\"}");
+          return;
+        }
         if (!c.list)
           throw Error(403, "permission_denied", "roomList required");
         auto metrics = rooms_.metrics();
@@ -487,6 +554,12 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
       if (request.method() != http::verb::post)
         throw Error(404, "bad_route", "POST required");
       auto method = target.path.substr(prefix.size());
+      if (rooms_.config().av_mode &&
+          (!av_management_claims_valid(rooms_.config(), claims) ||
+           (method != "ListRooms" && method != "ListParticipants" && method != "GetParticipant"))) {
+        respond(403, "{\"code\":\"permission_denied\",\"msg\":\"Use fenced AV operations\"}");
+        return;
+      }
       auto* service = google::protobuf::DescriptorPool::generated_pool()->FindServiceByName(
           "livekit.RoomService");
       auto* descriptor = service ? service->FindMethodByName(method) : nullptr;
@@ -541,6 +614,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
   std::array<char, 512> rpc_read_buffer_{};
   bool rpc_waiting_ = false;
   bool studio_admitted_ = false;
+  bool av_admitted_ = false;
 };
 }  // namespace
 

@@ -33,6 +33,12 @@ struct Limits {
 };
 
 struct Config {
+  // AV control-plane mode is explicit; legacy LiveKit protocol consumers keep
+  // their existing authentication behavior when disabled.
+  bool av_mode = false, av_allow_insecure_admission = false;
+  std::string node_id = "ND_cpp", node_incarnation;
+  std::string av_rtc_key, av_management_key, av_admission_url, av_admission_secret;
+  std::string av_admission_ca_file;
   std::string bind = "127.0.0.1";
   uint16_t port = 7880;
   uint16_t rtc_port_min = 50000, rtc_port_max = 50100;

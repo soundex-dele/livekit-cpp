@@ -1,4 +1,5 @@
 #include "lk/rooms.hpp"
+#include "lk/av_control.hpp"
 #include "lk/media_codec.hpp"
 #include "lk/sfu.hpp"
 #include "lk/media_quality.hpp"
@@ -196,6 +197,48 @@ void Rooms::updated(const std::shared_ptr<Participant>& p) {
 void Rooms::refresh_token(const std::shared_ptr<Participant>& p) {
   if (p->closed)
     return;
+  if (config_.av_mode) {
+    if (p->av_refresh_pending) {
+      return;
+    }
+    p->av_refresh_pending = true;
+    const auto snapshot = p->claims;
+    const auto version = p->info.version();
+    const auto lifetime = std::weak_ptr<int>(rpc_lifetime_);
+    av_admission(
+        io_.get_executor(), config_, snapshot,
+        [this, lifetime, p, snapshot, version](AdmissionResult result) {
+          if (lifetime.expired() || p->closed || stopping_) {
+            return;
+          }
+          p->av_refresh_pending = false;
+          if (!av_same_authorization(snapshot, p->claims) || version != p->info.version()) {
+            return;
+          }
+          if (!result.allowed) {
+            leave(p, livekit::PARTICIPANT_REMOVED);
+            return;
+          }
+          p->claims.av_grant_expires_at = result.expires_at;
+          p->claims.expires_at = std::min(now_ms() / 1000 + 60, result.expires_at);
+          livekit::SignalResponse response;
+          // Legacy Auth reports crypto failures by exception. Keep that
+          // compatibility boundary inside this asynchronous callback.
+          try {
+            response.set_refresh_token(Auth(config_.keys).refresh(p->claims));
+          } catch (const std::exception&) {
+            leave(p, livekit::PARTICIPANT_REMOVED);
+            return;
+          }
+          if (response.refresh_token().empty()) {
+            leave(p, livekit::PARTICIPANT_REMOVED);
+            return;
+          }
+          p->send(response);
+        });
+    p->next_token_refresh = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    return;
+  }
   try {
     livekit::SignalResponse response;
     response.set_refresh_token(Auth(config_.keys).refresh(p->claims));
@@ -251,6 +294,18 @@ std::shared_ptr<Participant> Rooms::join(const Claims& claims, bool auto_subscri
                                          std::shared_ptr<SignalSink> sink, int single_pc_protocol,
                                          const livekit::ClientInfo& client_info) {
   require(claims.join);
+  if (config_.av_mode) {
+    const auto binding = av_fences_.find(claims.room);
+    if (!av_rtc_claims_valid(config_, claims, now_ms() / 1000) || binding == av_fences_.end() ||
+        binding->second.sealed || binding->second.generation != claims.av_binding_generation) {
+      return {};
+    }
+    const auto target = binding->second.targets.find(claims.identity);
+    if (target != binding->second.targets.end() &&
+        (target->second.removed || target->second.revision > claims.av_policy_version)) {
+      return {};
+    }
+  }
   validate_join_names(claims);
   metadata_limit(claims.metadata, config_.limits);
   attributes_limit(claims.attributes, config_.limits);
@@ -429,7 +484,7 @@ std::shared_ptr<Participant> Rooms::join(const Claims& claims, bool auto_subscri
   join->set_ping_timeout(15);
   join->mutable_server_info()->set_version("1.9.0");
   join->mutable_server_info()->set_protocol(15);
-  join->mutable_server_info()->set_node_id("ND_cpp");
+  join->mutable_server_info()->set_node_id(config_.node_id);
   join->mutable_server_info()->set_debug_info("livekit-cpp/0.1.0 native " + config_.media_mode);
   for (const auto& codec : r.info.enabled_codecs())
     *join->add_enabled_publish_codecs() = codec;
@@ -467,6 +522,17 @@ std::shared_ptr<Participant> Rooms::resume(const Claims& claims, std::shared_ptr
   if (it == r.participants.end() || it->second->closed)
     return {};
   auto p = it->second;
+  if (config_.av_mode && (!av_rtc_claims_valid(config_, claims, now_ms() / 1000) ||
+                          !av_same_authorization(claims, p->claims))) {
+    return {};
+  }
+  if (config_.av_mode) {
+    // A newly admitted credential can renew authentication time without
+    // replacing server-authoritative capabilities or extending grant lifetime.
+    p->claims.av_grant_expires_at =
+        std::min(p->claims.av_grant_expires_at, claims.av_grant_expires_at);
+    p->claims.expires_at = std::min(claims.expires_at, p->claims.av_grant_expires_at);
+  }
   const auto last_signal = p->last_seen;
   auto previous = p->sink.lock();
   p->sink = sink;
@@ -480,7 +546,7 @@ std::shared_ptr<Participant> Rooms::resume(const Claims& claims, std::shared_ptr
   reconnect->set_last_message_seq(p->last_published_data_sequence);
   reconnect->mutable_server_info()->set_version("1.9.0");
   reconnect->mutable_server_info()->set_protocol(15);
-  reconnect->mutable_server_info()->set_node_id("ND_cpp");
+  reconnect->mutable_server_info()->set_node_id(config_.node_id);
   for (const auto& ice : config_.session_ice_servers(p->info.sid())) {
     auto* server = reconnect->add_ice_servers();
     for (const auto& url : ice.urls)
@@ -514,7 +580,8 @@ std::shared_ptr<Participant> Rooms::resume(const Claims& claims, std::shared_ptr
   p->send(response);
   p->subscriber->restart_ice();
   refresh_token(p);
-  p->next_token_refresh = std::chrono::steady_clock::now() + std::chrono::minutes(5);
+  p->next_token_refresh = std::chrono::steady_clock::now() +
+                          (config_.av_mode ? std::chrono::seconds(20) : std::chrono::seconds(300));
   return p;
 }
 
@@ -1783,9 +1850,14 @@ void Rooms::tick() {
     std::vector<std::shared_ptr<Participant>> expired;
     for (const auto& [_, r] : rooms_)
       for (const auto& [__, p] : r.participants)
-        if (now_ms() - p->last_seen > 30000)
+        if (now_ms() - p->last_seen > 30000 ||
+            (config_.av_mode && p->claims.av_grant_expires_at <= now_ms() / 1000))
           expired.push_back(p);
     for (auto& p : expired) {
+      if (config_.av_mode && p->claims.av_grant_expires_at <= now_ms() / 1000) {
+        leave(p, livekit::PARTICIPANT_REMOVED);
+        continue;
+      }
       if (auto sink = p->sink.lock()) {
         signal_closed(p, sink.get());
         sink->close();
@@ -1797,7 +1869,8 @@ void Rooms::tick() {
       for (const auto& [__, p] : r.participants)
         if (now >= p->next_token_refresh) {
           refresh_token(p);
-          p->next_token_refresh = now + std::chrono::minutes(5);
+          p->next_token_refresh =
+              now + (config_.av_mode ? std::chrono::seconds(20) : std::chrono::seconds(300));
         }
     for (auto it = rooms_.begin(); it != rooms_.end();) {
       auto& r = it->second;
